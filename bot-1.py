@@ -96,7 +96,23 @@ def post_image_to_facebook_page(image_bytes: bytes, ext: str, caption: str = "")
     files = {"source": (f"image.{ext}", io.BytesIO(image_bytes))}
     data = {"caption": caption, "access_token": FB_PAGE_ACCESS_TOKEN}
     response = requests.post(url, files=files, data=data, timeout=60)
-    response.raise_for_status()
+
+    if not response.ok:
+        # فيسبوك بيرجع تفاصيل الخطأ الحقيقية (code, message, error_subcode)
+        # جوه الـ JSON body مش جوه الـ status code بس، فلازم نطبعها صريح
+        try:
+            fb_error = response.json().get("error", {})
+        except ValueError:
+            fb_error = {"message": response.text}
+        logger.error(
+            "فيسبوك رفض النشر | status=%s | code=%s | subcode=%s | message=%s",
+            response.status_code,
+            fb_error.get("code"),
+            fb_error.get("error_subcode"),
+            fb_error.get("message"),
+        )
+        response.raise_for_status()
+
     return response.json()
 
 
@@ -137,20 +153,22 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     posted = 0
     failed = 0
+    last_error = None
     for image in images:
         try:
-            # نستخدم asyncio.to_thread عشان الـ request المحظور (blocking)
-            # يشتغل في thread منفصل من غير ما يوقف الـ event loop،
-            # ومع await هنا فعلا بنستنى نتيجته قبل ما نعد عليه
             await asyncio.to_thread(
                 post_image_to_facebook_page, image["bytes"], image["ext"]
             )
             posted += 1
-        except Exception:
+        except Exception as e:
             logger.exception("فشل نشر صورة على فيسبوك")
+            last_error = str(e)
             failed += 1
 
-    await update.message.reply_text(f"تم النشر: {posted} صورة ✅\nفشل: {failed} صورة")
+    summary = f"تم النشر: {posted} صورة ✅\nفشل: {failed} صورة"
+    if last_error:
+        summary += f"\n\nآخر خطأ:\n{last_error}"
+    await update.message.reply_text(summary)
 
 
 def main() -> None:
