@@ -1,0 +1,3 @@
+python-telegram-bot[webhooks]
+PyMuPDF
+requests
