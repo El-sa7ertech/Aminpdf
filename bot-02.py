@@ -36,14 +36,13 @@
 إعداد Render:
     - Service type: Web Service (مش Background Worker)
     - Build Command:  pip install -r requirements.txt
-    - Start Command:  python bot-1.py
+    - Start Command:  python bot-1-webhook.py
     - لازم تحط WEBHOOK_URL = رابط السيرفس نفسه بعد ما ينعمل Deploy أول مرة
 """
 
 import os
 import io
 import re
-import time
 import json
 import asyncio
 import logging
@@ -173,117 +172,28 @@ def _is_user_allowed(user) -> bool:
     return not ALLOWED_USER_IDS or (user is not None and user.id in ALLOWED_USER_IDS)
 
 
-# عدد محاولات إعادة التحميل لو الاتصال اتقطع في النص
-MAX_DOWNLOAD_RETRIES = 4
-RETRY_BACKOFF_SECONDS = 3  # بيتضاعف مع كل محاولة فاشلة
-
-
-def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
+def download_pdf_to_tempfile(url: str) -> str:
     """يحمّل PDF من رابط ويكتبه على القرص مباشرة (chunk بعد chunk) بدل ما يجمّعه
     في الرام، عشان ملفات كبيرة (لحد 300 ميجا) متستهلكش ذاكرة زيادة أثناء التحميل.
-    بيرجع مسار الملف المؤقت. بيتأكد من نوع المحتوى الفعلي (magic bytes) بعد التحميل.
+    بيرجع مسار الملف المؤقت. بيتأكد من نوع المحتوى الفعلي (magic bytes) بعد التحميل."""
+    # (connect timeout, read timeout) — الـ read لازم يكون كبير عشان يكفي تحميل
+    # ملفات كبيرة (لحد 300 ميجا) على اتصالات مش سريعة جدًا.
+    response = requests.get(url, stream=True, timeout=(15, 300))
+    response.raise_for_status()
 
-    لو اتبعت progress_callback، بيتنادى بشكل دوري بـ (downloaded_bytes, total_bytes)
-    — total_bytes بتبقى None لو السيرفر مش راجع Content-Length.
-
-    لو الاتصال انقطع في النص (مشكلة شبكة شائعة مع الملفات الكبيرة)، بيحاول تاني
-    لحد MAX_DOWNLOAD_RETRIES مرات. لو السيرفر بيدعم Range requests (Accept-Ranges: bytes)
-    بيكمل من نفس النقطة اللي اتقطعت عندها بدل ما يعيد تحميل الملف من الأول."""
-    tmp_path = None
-    downloaded = 0
-    total_size = None
-    supports_range = False
-    last_report_time = 0.0
-    last_report_bytes = 0
-    REPORT_EVERY_SECONDS = 2.0
-    REPORT_EVERY_BYTES = 5 * 1024 * 1024  # أو كل 5 ميجا، أيهما أقرب
-
-    attempt = 0
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="pdf_link_")
+    total = 0
     try:
-        while True:
-            attempt += 1
-            resume = downloaded > 0 and supports_range
-            headers = {"Range": f"bytes={downloaded}-"} if resume else {}
-
-            try:
-                # (connect timeout, read timeout) — الـ read لازم يكون كبير عشان يكفي
-                # تحميل ملفات كبيرة (لحد 300 ميجا) على اتصالات مش سريعة جدًا.
-                response = requests.get(url, stream=True, timeout=(15, 300), headers=headers)
-
-                if resume and response.status_code != 206:
-                    # السيرفر ماستجابش لطلب الاستئناف، لازم نبدأ من الأول تاني
-                    response.close()
-                    downloaded = 0
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                    tmp_path = None
-                    resume = False
-                    response = requests.get(url, stream=True, timeout=(15, 300))
-
-                response.raise_for_status()
-
-                if total_size is None:
-                    content_length = response.headers.get("Content-Length")
-                    if content_length and content_length.isdigit():
-                        total_size = int(content_length) + (downloaded if resume else 0)
-                    supports_range = response.headers.get("Accept-Ranges", "").lower() == "bytes"
-
-                if tmp_path is None:
-                    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="pdf_link_")
-                    os.close(fd)
-
-                with open(tmp_path, "ab" if resume else "wb") as f:
-                    for chunk in response.iter_content(chunk_size=256 * 1024):
-                        if not chunk:
-                            continue
-                        downloaded += len(chunk)
-                        if downloaded > MAX_PDF_DOWNLOAD_BYTES:
-                            raise ValueError(
-                                f"حجم الملف أكبر من الحد المسموح "
-                                f"({MAX_PDF_DOWNLOAD_BYTES // (1024 * 1024)} ميجا)."
-                            )
-                        f.write(chunk)
-
-                        if progress_callback:
-                            now = time.monotonic()
-                            if (
-                                now - last_report_time >= REPORT_EVERY_SECONDS
-                                or downloaded - last_report_bytes >= REPORT_EVERY_BYTES
-                            ):
-                                last_report_time = now
-                                last_report_bytes = downloaded
-                                try:
-                                    progress_callback(downloaded, total_size)
-                                except Exception:
-                                    logger.exception("فشل استدعاء progress_callback")
-
-                break  # التحميل خلص بنجاح، اخرج من حلقة إعادة المحاولة
-
-            except (
-                requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ) as e:
-                logger.warning(
-                    "انقطع تحميل الملف (محاولة %s/%s): %s", attempt, MAX_DOWNLOAD_RETRIES, e
-                )
-                if attempt >= MAX_DOWNLOAD_RETRIES:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_PDF_DOWNLOAD_BYTES:
                     raise ValueError(
-                        f"الاتصال بيفصل مع الرابط باستمرار بعد {MAX_DOWNLOAD_RETRIES} محاولات."
-                    ) from e
-                if progress_callback:
-                    try:
-                        progress_callback(downloaded, total_size)
-                    except Exception:
-                        pass
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-                continue
-
-        if progress_callback:
-            try:
-                progress_callback(downloaded, total_size)  # تقرير أخير بعد ما يخلص
-            except Exception:
-                logger.exception("فشل استدعاء progress_callback")
+                        f"حجم الملف أكبر من الحد المسموح ({MAX_PDF_DOWNLOAD_BYTES // (1024 * 1024)} ميجا)."
+                    )
+                f.write(chunk)
 
         with open(tmp_path, "rb") as f:
             header = f.read(4)
@@ -292,8 +202,8 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
 
         return tmp_path
     except Exception:
-        # لو حصل أي خطأ نهائي، امسح الملف الجزئي اللي اتحمّل قبل ما نرمي الاستثناء
-        if tmp_path and os.path.exists(tmp_path):
+        # لو حصل أي خطأ، امسح الملف الجزئي اللي اتحمّل قبل ما نرمي الاستثناء
+        if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
 
@@ -433,36 +343,17 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     url = match.group(0)
-    progress_msg = await update.message.reply_text("جاري تحميل الـ PDF من الرابط... 0%")
-    loop = asyncio.get_running_loop()
-
-    def on_progress(downloaded: int, total_size):
-        downloaded_mb = downloaded / (1024 * 1024)
-        if total_size:
-            percent = min(100, int(downloaded * 100 / total_size))
-            total_mb = total_size / (1024 * 1024)
-            text = f"جاري تحميل الـ PDF... {percent}% ({downloaded_mb:.1f} / {total_mb:.1f} ميجا)"
-        else:
-            # السيرفر مش راجع حجم الملف الكلي، فبنعرض بس اللي اتحمّل لحد دلوقتي
-            text = f"جاري تحميل الـ PDF... {downloaded_mb:.1f} ميجا"
-
-        async def _edit():
-            try:
-                await progress_msg.edit_text(text)
-            except Exception:
-                pass  # تجاهل أخطاء rate limit البسيطة بتاعة تعديل الرسالة
-
-        asyncio.run_coroutine_threadsafe(_edit(), loop)
+    await update.message.reply_text("جاري تحميل الـ PDF من الرابط...")
 
     try:
-        tmp_path = await asyncio.to_thread(download_pdf_to_tempfile, url, on_progress)
+        tmp_path = await asyncio.to_thread(download_pdf_to_tempfile, url)
     except Exception as e:
         logger.exception("فشل تحميل الـ PDF من الرابط")
-        await progress_msg.edit_text(f"معلش، مقدرتش أحمّل الملف من الرابط: {e}")
+        await update.message.reply_text(f"معلش، مقدرتش أحمّل الملف من الرابط: {e}")
         return
 
     try:
-        await progress_msg.edit_text("تم التحميل، جاري المعالجة...")
+        await update.message.reply_text("تم التحميل، جاري المعالجة...")
         await process_pdf(update, tmp_path)
     finally:
         if os.path.exists(tmp_path):
