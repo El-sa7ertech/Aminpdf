@@ -52,7 +52,7 @@ import requests
 import fitz  # PyMuPDF
 
 from telegram import Update
-from telegram.error import TimedOut, NetworkError, RetryAfter
+from telegram.error import TimedOut, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
@@ -320,16 +320,6 @@ async def _reply_document_with_retry(
                 caption=caption,
             )
             return
-        except RetryAfter as e:
-            # تليجرام نفسه بيقول لازم تستنى كام ثانية بالظبط قبل ما تعيد المحاولة
-            wait_seconds = e.retry_after + 1
-            logger.warning(
-                "تليجرام طلب الانتظار (flood control) في إرسال %s، هنستنى %s ثانية",
-                filename,
-                wait_seconds,
-            )
-            await asyncio.sleep(wait_seconds)
-            continue
         except (TimedOut, NetworkError) as e:
             if attempt >= MAX_SEND_RETRIES:
                 raise
@@ -415,25 +405,10 @@ async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_pa
 
             await send_chunk_to_second_account(context, chunk_bytes, from_page, to_page)
 
-            try:
-                await update.message.reply_text(
-                    f"تم إرسال الملف {group_number}/{total_groups} "
-                    f"(صفحات {from_page}-{to_page}) ✅"
-                )
-            except RetryAfter as e:
-                logger.warning(
-                    "فلود كنترول على رسالة التأكيد، هنستنى %s ثانية", e.retry_after
-                )
-                await asyncio.sleep(e.retry_after + 1)
-            except Exception:
-                # رسالة التأكيد مش أساسية، لو فشلت منكملش نوقف عملية الإرسال كلها بسببها
-                logger.exception(
-                    "فشل إرسال رسالة تأكيد الجزء %s-%s، هنكمل عادي", from_page, to_page
-                )
-
-            # تأخير بسيط بين كل جزء وبعده عشان نتجنب حد الفلود بتاع تليجرام
-            # (خصوصًا مع ملفات فيها أجزاء كتير زي دي)
-            await asyncio.sleep(1.2)
+            await update.message.reply_text(
+                f"تم إرسال الملف {group_number}/{total_groups} "
+                f"(صفحات {from_page}-{to_page}) ✅"
+            )
     finally:
         doc.close()
 
