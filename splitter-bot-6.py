@@ -272,7 +272,6 @@ def _log_memory_usage(context_label: str) -> None:
 
 
 
-def build_pdf_chunk_bytes(doc, from_page: int, to_page: int) -> bytes:
     """بيبني ملف PDF مستقل يحتوي بس على نطاق الصفحات ده (from_page/to_page أرقام
     مبنية على 1)، وبيرجعه كـ bytes جاهزة للإرسال. مبيلمسش الملف الأصلي."""
     chunk_doc = fitz.open()
