@@ -44,9 +44,11 @@
 import os
 import io
 import re
+import gc
 import time
 import asyncio
 import logging
+import resource
 import tempfile
 import requests
 import fitz  # PyMuPDF
@@ -257,7 +259,19 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
         raise
 
 
-def build_pdf_chunk_bytes(doc: "fitz.Document", from_page: int, to_page: int) -> bytes:
+def _log_memory_usage(context_label: str) -> None:
+    """بيسجل بالـ logs أعلى استهلاك رام وصلت له العملية لحد دلوقتي (بالميجا).
+    مفيد جدًا عشان تشوف بالـ logs بتاعة Render هل الرام بتزيد بشكل متراكم مع
+    كل جزء ولا لأ (لو بتزيد باستمرار من غير ما تنزل، ده مؤشر على مشكلة
+    OOM محتملة قبل ما تحصل فعليًا)."""
+    try:
+        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        logger.info("استهلاك الرام (peak) بعد %s: %.1f ميجا", context_label, peak_kb / 1024)
+    except Exception:
+        pass
+
+
+
     """بيبني ملف PDF مستقل يحتوي بس على نطاق الصفحات ده (from_page/to_page أرقام
     مبنية على 1)، وبيرجعه كـ bytes جاهزة للإرسال. مبيلمسش الملف الأصلي."""
     chunk_doc = fitz.open()
@@ -361,6 +375,8 @@ async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_pa
         await update.message.reply_text("الملف ده فاضي من الصفحات.")
         return
 
+    _log_memory_usage("فتح الملف (قبل بداية التقسيم)")
+
     total_groups = (total_pages + PAGES_PER_GROUP - 1) // PAGES_PER_GROUP
     await update.message.reply_text(
         f"الملف فيه {total_pages} صفحة.\n"
@@ -430,6 +446,12 @@ async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_pa
                 logger.exception(
                     "فشل إرسال رسالة تأكيد الجزء %s-%s، هنكمل عادي", from_page, to_page
                 )
+
+            # تنظيف ذاكرة صريح بعد كل جزء + تسجيل استهلاك الرام الحالي بالـ logs
+            # عشان تقدر تتابع على Render هل فيه تراكم رام مع الأجزاء ولا لأ
+            del chunk_bytes
+            gc.collect()
+            _log_memory_usage(f"الجزء {group_number}/{total_groups}")
 
             # تأخير بسيط بين كل جزء وبعده عشان نتجنب حد الفلود بتاع تليجرام
             # (خصوصًا مع ملفات فيها أجزاء كتير زي دي)
