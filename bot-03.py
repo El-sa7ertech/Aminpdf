@@ -177,16 +177,6 @@ def _is_user_allowed(user) -> bool:
 MAX_DOWNLOAD_RETRIES = 4
 RETRY_BACKOFF_SECONDS = 3  # بيتضاعف مع كل محاولة فاشلة
 
-# بعض السيرفرات بترفض الطلبات اللي مالهاش User-Agent شبه متصفح حقيقي
-# (بتفتكرها بوت/سكريبت وترفضها بـ 400/403). بنبعت هيدر شبه متصفح عادي.
-DOWNLOAD_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "*/*",
-}
-
 
 def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
     """يحمّل PDF من رابط ويكتبه على القرص مباشرة (chunk بعد chunk) بدل ما يجمّعه
@@ -213,9 +203,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
         while True:
             attempt += 1
             resume = downloaded > 0 and supports_range
-            headers = dict(DOWNLOAD_HEADERS)
-            if resume:
-                headers["Range"] = f"bytes={downloaded}-"
+            headers = {"Range": f"bytes={downloaded}-"} if resume else {}
 
             try:
                 # (connect timeout, read timeout) — الـ read لازم يكون كبير عشان يكفي
@@ -230,9 +218,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
                         os.remove(tmp_path)
                     tmp_path = None
                     resume = False
-                    response = requests.get(
-                        url, stream=True, timeout=(15, 300), headers=DOWNLOAD_HEADERS
-                    )
+                    response = requests.get(url, stream=True, timeout=(15, 300))
 
                 response.raise_for_status()
 
