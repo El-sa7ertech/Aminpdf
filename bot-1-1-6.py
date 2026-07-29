@@ -26,12 +26,6 @@
     ALLOWED_USER_IDS     -> (اختياري) أرقام يوزرات تليجرام المسموح لهم، مفصولة بفاصلة
                             مثال: 123456789,987654321
                             لو سبتها فاضية، أي حد هيقدر يستخدم البوت وينشر على صفحتك!
-    SECOND_ACCOUNT_CHAT_ID -> (اختياري) chat_id بتاع حسابك التاني على تليجرام.
-                            لو موجود، البوت هيبعتله نسخة PDF من كل مجموعة صفحات
-                            قبل ما يرفع صورها على فيسبوك. سيبها فاضية لو مش عايز الخاصية دي.
-                            عشان تجيبه: ابعت أي رسالة للبوت من الحساب ده، وبعدين افتح
-                            https://api.telegram.org/bot<TOKEN>/getUpdates وهتلاقي
-                            الرقم جوه "chat":{"id": ...}
 
 طريقة الحصول على FB_PAGE_ACCESS_TOKEN:
     1. اعمل Facebook App من developers.facebook.com
@@ -103,13 +97,6 @@ MAX_PDF_DOWNLOAD_BYTES = int(os.environ.get("MAX_PDF_DOWNLOAD_BYTES", str(300 * 
 # مثال: PDF من 100 صفحة مع PAGES_PER_POST = 20 هيتقسم على 5 بوستات.
 PAGES_PER_POST = int(os.environ.get("PAGES_PER_POST", "20"))
 
-# chat_id بتاع حسابك التاني اللي هيوصله نسخة PDF من كل مجموعة صفحات
-# قبل ما يترفع صورها على فيسبوك. سيبها فاضية لو مش عايز الخاصية دي.
-SECOND_ACCOUNT_CHAT_ID = os.environ.get("SECOND_ACCOUNT_CHAT_ID", "").strip()
-
-# حد تليجرام لحجم أي ملف بيتبعت من البوت (50 ميجا)
-TELEGRAM_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
-
 
 def iter_page_chunks(doc: "fitz.Document", pages_per_chunk: int):
     """بيمشي على صفحات الـ PDF مجموعة مجموعة (زي PAGES_PER_POST)، وبيستخرج صور
@@ -132,130 +119,10 @@ def iter_page_chunks(doc: "fitz.Document", pages_per_chunk: int):
         yield {"from_page": start + 1, "to_page": end, "images": images}
 
 
-def build_pdf_chunk_bytes(doc: "fitz.Document", from_page: int, to_page: int) -> bytes:
-    """بيبني ملف PDF مستقل يحتوي بس على نطاق الصفحات ده (from_page/to_page أرقام
-    مبنية على 1)، وبيرجعه كـ bytes جاهزة للإرسال. مبيلمسش الملف الأصلي."""
-    chunk_doc = fitz.open()
-    try:
-        chunk_doc.insert_pdf(doc, from_page=from_page - 1, to_page=to_page - 1)
-        return chunk_doc.tobytes()
-    finally:
-        chunk_doc.close()
-
-
-async def send_chunk_to_second_account(
-    context: ContextTypes.DEFAULT_TYPE,
-    pdf_bytes: bytes,
-    from_page: int,
-    to_page: int,
-) -> None:
-    """بيبعت نطاق الصفحات كملف PDF لحسابك التاني (SECOND_ACCOUNT_CHAT_ID)،
-    لو الإعداد ده مش فاضي. بيتنادى قبل ما يترفع صور المجموعة على فيسبوك."""
-    if not SECOND_ACCOUNT_CHAT_ID:
-        return
-
-    if len(pdf_bytes) > TELEGRAM_MAX_DOCUMENT_BYTES:
-        logger.warning(
-            "مجموعة الصفحات %s-%s حجمها أكبر من حد تليجرام (50 ميجا)، مش هتترسل للحساب التاني",
-            from_page,
-            to_page,
-        )
-        return
-
-    try:
-        await context.bot.send_document(
-            chat_id=SECOND_ACCOUNT_CHAT_ID,
-            document=io.BytesIO(pdf_bytes),
-            filename=f"pages_{from_page}-{to_page}.pdf",
-            caption=f"صفحات {from_page} - {to_page}",
-        )
-    except Exception:
-        logger.exception(
-            "فشل إرسال مجموعة الصفحات %s-%s للحساب التاني", from_page, to_page
-        )
-
-
 # أقصى عدد صور في البوست الواحد (فيسبوك بيحدد حد أقصى).
 # ده استخدامه كحماية إضافية جوه كل مجموعة صفحات: لو مجموعة الـ 20 صفحة
 # نفسها فيها صور أكتر من الحد ده (نادر)، بتتقسم على أكتر من بوست.
 MAX_PHOTOS_PER_POST = 100
-
-
-# --- حماية من Rate Limit بتاع Graph API ---
-# لو فيسبوك رجّع أي كود من دول (أو HTTP 429)، معناه إحنا بنبعت طلبات كتير
-# بسرعة وهو بيرفض مؤقتًا. الأكواد دي معروفة ومكررة في توثيق Graph API:
-#   4   -> Application request limit reached (rate limit عام على مستوى الـ app)
-#   17  -> User request limit reached
-#   32  -> Page request limit reached
-#   613 -> Calls to this API have exceeded the rate limit
-FB_RATE_LIMIT_ERROR_CODES = {4, 17, 32, 613}
-
-MAX_FB_RETRIES = 5
-FB_RETRY_BACKOFF_SECONDS = 5  # بيتضاعف مع كل محاولة (5, 10, 20, 40, ...)
-
-
-class FacebookRateLimitError(Exception):
-    """بيترمى لما فيسبوك يرفض الطلب بسبب rate limit حتى بعد كل المحاولات."""
-
-
-def _fb_error_info(response: requests.Response) -> dict:
-    try:
-        return response.json().get("error", {})
-    except ValueError:
-        return {"message": response.text}
-
-
-def _is_fb_rate_limit(response: requests.Response, fb_error: dict) -> bool:
-    if response.status_code == 429:
-        return True
-    code = fb_error.get("code")
-    return code in FB_RATE_LIMIT_ERROR_CODES
-
-
-def _fb_request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
-    """بيعمل نفس طلب requests العادي، لكن لو فيسبوك رجّع rate limit بيستنى وبيعيد
-    المحاولة (backoff تصاعدي)، وبيحترم هيدر Retry-After لو فيسبوك بعته."""
-    attempt = 0
-    while True:
-        attempt += 1
-        response = requests.request(method, url, **kwargs)
-
-        if response.ok:
-            return response
-
-        fb_error = _fb_error_info(response)
-
-        if _is_fb_rate_limit(response, fb_error):
-            if attempt >= MAX_FB_RETRIES:
-                logger.error(
-                    "فيسبوك rate limit مستمر بعد %s محاولات | code=%s | message=%s",
-                    MAX_FB_RETRIES,
-                    fb_error.get("code"),
-                    fb_error.get("message"),
-                )
-                raise FacebookRateLimitError(
-                    fb_error.get("message", "تم تجاوز حد الطلبات المسموح به من فيسبوك.")
-                )
-
-            retry_after = response.headers.get("Retry-After")
-            if retry_after and retry_after.isdigit():
-                wait_seconds = int(retry_after)
-            else:
-                wait_seconds = FB_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-
-            logger.warning(
-                "فيسبوك رجّع rate limit (محاولة %s/%s) | code=%s | هنستنى %s ثانية",
-                attempt,
-                MAX_FB_RETRIES,
-                fb_error.get("code"),
-                wait_seconds,
-            )
-            time.sleep(wait_seconds)
-            continue
-
-        # خطأ تاني مش rate limit -> يتعامل بيه زي ما كان (يتسجل ويترمى فورًا)
-        _log_fb_error(response, fb_error)
-        response.raise_for_status()
 
 
 def upload_unpublished_photo(image_bytes: bytes, ext: str) -> str:
@@ -266,7 +133,8 @@ def upload_unpublished_photo(image_bytes: bytes, ext: str) -> str:
         "published": "false",
         "access_token": FB_PAGE_ACCESS_TOKEN,
     }
-    response = _fb_request_with_retry("POST", url, files=files, data=data, timeout=60)
+    response = requests.post(url, files=files, data=data, timeout=60)
+    _raise_with_fb_error(response)
     return response.json()["id"]
 
 
@@ -279,25 +147,25 @@ def create_post_with_photos(photo_ids: list[str], caption: str = "") -> dict:
     }
     for i, photo_id in enumerate(photo_ids):
         data[f"attached_media[{i}]"] = json.dumps({"media_fbid": photo_id})
-    response = _fb_request_with_retry("POST", url, data=data, timeout=60)
+    response = requests.post(url, data=data, timeout=60)
+    _raise_with_fb_error(response)
     return response.json()
 
 
-def _log_fb_error(response: requests.Response, fb_error: dict) -> None:
-    """يطبع رسالة الخطأ الحقيقية من فيسبوك في اللوج."""
-    logger.error(
-        "فيسبوك رفض الطلب | status=%s | code=%s | subcode=%s | message=%s",
-        response.status_code,
-        fb_error.get("code"),
-        fb_error.get("error_subcode"),
-        fb_error.get("message"),
-    )
-
-
 def _raise_with_fb_error(response: requests.Response) -> None:
-    """محتفظ بيها لأي استخدام قديم: بتطبع الخطأ وترمي استثناء عادي."""
+    """يطبع رسالة الخطأ الحقيقية من فيسبوك في اللوج قبل ما يرفع الاستثناء."""
     if not response.ok:
-        _log_fb_error(response, _fb_error_info(response))
+        try:
+            fb_error = response.json().get("error", {})
+        except ValueError:
+            fb_error = {"message": response.text}
+        logger.error(
+            "فيسبوك رفض الطلب | status=%s | code=%s | subcode=%s | message=%s",
+            response.status_code,
+            fb_error.get("code"),
+            fb_error.get("error_subcode"),
+            fb_error.get("message"),
+        )
         response.raise_for_status()
 
 
@@ -444,9 +312,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
         raise
 
 
-async def process_pdf(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str
-) -> None:
+async def process_pdf(update: Update, pdf_path: str) -> None:
     """المنطق المشترك: بيفتح الـ PDF من مساره على القرص، وبيمشي مجموعة صفحات
     (PAGES_PER_POST) في كل مرة — يستخرج صورها، يرفعها، ينشر البوست، وبعدين
     ينتقل للمجموعة التالية. كده صور مجموعة واحدة بس بتفضل في الرام في أي لحظة،
@@ -479,25 +345,8 @@ async def process_pdf(
 
     try:
         for group_number, group in enumerate(iter_page_chunks(doc, PAGES_PER_POST), start=1):
-            # إرسال المجموعة كـ PDF للحساب التاني بيحصل لكل مجموعة صفحات دايمًا،
-            # حتى لو المجموعة دي مفيهاش صور جوه هتترفع على فيسبوك.
-            if SECOND_ACCOUNT_CHAT_ID:
-                try:
-                    chunk_bytes = await asyncio.to_thread(
-                        build_pdf_chunk_bytes, doc, group["from_page"], group["to_page"]
-                    )
-                    await send_chunk_to_second_account(
-                        context, chunk_bytes, group["from_page"], group["to_page"]
-                    )
-                except Exception:
-                    logger.exception(
-                        "فشل بناء/إرسال نسخة PDF من المجموعة %s-%s للحساب التاني",
-                        group["from_page"],
-                        group["to_page"],
-                    )
-
             if not group["images"]:
-                continue  # مجموعة صفحات من غير صور، تجاهلها ومتعملش بوست فاضي على فيسبوك
+                continue  # مجموعة صفحات من غير صور، تجاهلها ومتعملش بوست فاضي
 
             groups_with_images += 1
             total_images += len(group["images"])
@@ -578,7 +427,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(tmp_path)
-        await process_pdf(update, context, tmp_path)
+        await process_pdf(update, tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -628,7 +477,7 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         await progress_msg.edit_text("تم التحميل، جاري المعالجة...")
-        await process_pdf(update, context, tmp_path)
+        await process_pdf(update, tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
