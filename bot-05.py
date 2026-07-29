@@ -478,15 +478,10 @@ async def process_pdf(
     last_error = None
 
     try:
-        # --- المرحلة 1: إرسال كل مجموعات الصفحات كملفات PDF للحساب التاني أولًا ---
-        # بتخلص المرحلة دي بالكامل (كل المجموعات) قبل ما نبدأ أي نشر على فيسبوك.
-        if SECOND_ACCOUNT_CHAT_ID:
-            await update.message.reply_text(
-                f"جاري إرسال كل المجموعات ({total_groups}) للحساب التاني..."
-            )
-            for group_number, group in enumerate(
-                iter_page_chunks(doc, PAGES_PER_POST), start=1
-            ):
+        for group_number, group in enumerate(iter_page_chunks(doc, PAGES_PER_POST), start=1):
+            # إرسال المجموعة كـ PDF للحساب التاني بيحصل لكل مجموعة صفحات دايمًا،
+            # حتى لو المجموعة دي مفيهاش صور جوه هتترفع على فيسبوك.
+            if SECOND_ACCOUNT_CHAT_ID:
                 try:
                     chunk_bytes = await asyncio.to_thread(
                         build_pdf_chunk_bytes, doc, group["from_page"], group["to_page"]
@@ -500,12 +495,7 @@ async def process_pdf(
                         group["from_page"],
                         group["to_page"],
                     )
-            await update.message.reply_text(
-                "تم إرسال كل المجموعات للحساب التاني ✅\nجاري بدء النشر على فيسبوك..."
-            )
 
-        # --- المرحلة 2: الرجوع من البداية والنشر على فيسبوك مجموعة مجموعة ---
-        for group_number, group in enumerate(iter_page_chunks(doc, PAGES_PER_POST), start=1):
             if not group["images"]:
                 continue  # مجموعة صفحات من غير صور، تجاهلها ومتعملش بوست فاضي على فيسبوك
 
