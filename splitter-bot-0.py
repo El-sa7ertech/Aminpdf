@@ -27,12 +27,6 @@
                             لو سبتها فاضية، أي حد هيقدر يستخدم البوت.
     PAGES_PER_GROUP      -> (اختياري) عدد الصفحات في كل ملف PDF فرعي (افتراضي 20)
     MAX_PDF_DOWNLOAD_BYTES -> (اختياري) أقصى حجم لملف PDF بيتحمل من رابط (افتراضي 300 ميجا)
-    SECOND_ACCOUNT_CHAT_ID -> (اختياري) chat_id بتاع حساب تاني على تليجرام.
-                            لو موجود، البوت هيبعتله نسخة من كل ملف فرعي زي ما بيتبعت
-                            للشخص الأصلي. سيبها فاضية لو مش عايز الخاصية دي.
-                            عشان تجيبه: ابعت أي رسالة للبوت من الحساب ده، وبعدين افتح
-                            https://api.telegram.org/bot<TOKEN>/getUpdates وهتلاقي
-                            الرقم جوه "chat":{"id": ...}
 
 إعداد Render:
     - Service type: Web Service (مش Background Worker)
@@ -119,10 +113,6 @@ PAGES_PER_GROUP = int(os.environ.get("PAGES_PER_GROUP", "20"))
 
 # حد تليجرام لحجم أي ملف بيتبعت من البوت (50 ميجا)
 TELEGRAM_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
-
-# chat_id بتاع حساب تاني اللي هيوصله نسخة من كل ملف فرعي بعد ما يترسل للشخص الأصلي.
-# سيبها فاضية لو مش عايز الخاصية دي.
-SECOND_ACCOUNT_CHAT_ID = os.environ.get("SECOND_ACCOUNT_CHAT_ID", "").strip()
 
 # عدد محاولات إعادة التحميل لو الاتصال اتقطع في النص
 MAX_DOWNLOAD_RETRIES = 4
@@ -266,38 +256,6 @@ def build_pdf_chunk_bytes(doc: "fitz.Document", from_page: int, to_page: int) ->
         chunk_doc.close()
 
 
-async def send_chunk_to_second_account(
-    context: ContextTypes.DEFAULT_TYPE,
-    pdf_bytes: bytes,
-    from_page: int,
-    to_page: int,
-) -> None:
-    """بيبعت نسخة من ملف الصفحات دي لحسابك التاني (SECOND_ACCOUNT_CHAT_ID)،
-    لو الإعداد ده مش فاضي. بيتنادى بعد ما يترسل الملف للشخص الأصلي."""
-    if not SECOND_ACCOUNT_CHAT_ID:
-        return
-
-    if len(pdf_bytes) > TELEGRAM_MAX_DOCUMENT_BYTES:
-        logger.warning(
-            "مجموعة الصفحات %s-%s حجمها أكبر من حد تليجرام (50 ميجا)، مش هتترسل للحساب التاني",
-            from_page,
-            to_page,
-        )
-        return
-
-    try:
-        await context.bot.send_document(
-            chat_id=SECOND_ACCOUNT_CHAT_ID,
-            document=io.BytesIO(pdf_bytes),
-            filename=f"pages_{from_page}-{to_page}.pdf",
-            caption=f"صفحات {from_page} - {to_page}",
-        )
-    except Exception:
-        logger.exception(
-            "فشل إرسال مجموعة الصفحات %s-%s للحساب التاني", from_page, to_page
-        )
-
-
 async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str) -> None:
     """بيفتح الـ PDF من مساره على القرص، ويقسمه لمجموعات صفحات (PAGES_PER_GROUP)،
     وبيبعت كل مجموعة كملف PDF مستقل رد في نفس المحادثة اللي جت منها."""
@@ -363,14 +321,6 @@ async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_pa
                 logger.exception("فشل إرسال نطاق الصفحات %s-%s", from_page, to_page)
                 failed_count += 1
                 last_error = str(e)
-                continue
-
-            await send_chunk_to_second_account(context, chunk_bytes, from_page, to_page)
-
-            await update.message.reply_text(
-                f"تم إرسال الملف {group_number}/{total_groups} "
-                f"(صفحات {from_page}-{to_page}) ✅"
-            )
     finally:
         doc.close()
 
