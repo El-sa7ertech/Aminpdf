@@ -52,8 +52,6 @@ import requests
 import fitz  # PyMuPDF
 
 from telegram import Update
-from telegram.error import TimedOut, NetworkError
-from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -300,41 +298,6 @@ async def send_chunk_to_second_account(
         )
 
 
-# عدد محاولات إعادة إرسال الملف لو حصل Timeout أثناء الرفع لتليجرام
-MAX_SEND_RETRIES = 3
-SEND_RETRY_BACKOFF_SECONDS = 5  # بيتضاعف مع كل محاولة (5, 10, ...)
-
-
-async def _reply_document_with_retry(
-    update: Update, pdf_bytes: bytes, filename: str, caption: str
-):
-    """بيبعت الملف للمستخدم، ولو حصل Timeout (شائع مع الملفات الكبيرة أو النت
-    البطيء) بيعيد المحاولة قبل ما يستسلم."""
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            await update.message.reply_document(
-                document=io.BytesIO(pdf_bytes),
-                filename=filename,
-                caption=caption,
-            )
-            return
-        except (TimedOut, NetworkError) as e:
-            if attempt >= MAX_SEND_RETRIES:
-                raise
-            wait_seconds = SEND_RETRY_BACKOFF_SECONDS * attempt
-            logger.warning(
-                "تايم أوت في إرسال %s (محاولة %s/%s)، هنستنى %s ثانية ونعيد",
-                filename,
-                attempt,
-                MAX_SEND_RETRIES,
-                wait_seconds,
-            )
-            await asyncio.sleep(wait_seconds)
-            continue
-
-
 async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str) -> None:
     """بيفتح الـ PDF من مساره على القرص، ويقسمه لمجموعات صفحات (PAGES_PER_GROUP)،
     وبيبعت كل مجموعة كملف PDF مستقل رد في نفس المحادثة اللي جت منها."""
@@ -390,9 +353,8 @@ async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_pa
                 continue
 
             try:
-                await _reply_document_with_retry(
-                    update,
-                    chunk_bytes,
+                await update.message.reply_document(
+                    document=io.BytesIO(chunk_bytes),
                     filename=f"pages_{from_page}-{to_page}.pdf",
                     caption=f"صفحات {from_page} - {to_page} ({group_number}/{total_groups})",
                 )
@@ -512,13 +474,7 @@ def main() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=120,
-        write_timeout=120,
-        pool_timeout=30,
-    )
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.Document.ALL, handle_pdf_document))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Entity("url"), handle_pdf_link)
