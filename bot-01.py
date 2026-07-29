@@ -46,7 +46,6 @@ import re
 import json
 import asyncio
 import logging
-import tempfile
 import requests
 import fitz  # PyMuPDF
 
@@ -88,33 +87,41 @@ ALLOWED_USER_IDS = {
 MIN_IMAGE_BYTES = 3000  # علشان نتجاهل صور صغيرة جدًا (أيقونات/خطوط مدمجة)
 
 # حد أقصى لحجم أي PDF بيتحمل من رابط (بالبايت)، عشان مايبقاش فيه استغلال
-# برابط بيرجّع ملف ضخم يفجر الرام. القيمة الافتراضية هنا 300 ميجا
-# (البوت لاستخدام شخصي، فمفيش داعي لحد صغير زي حالة البوت العام).
-MAX_PDF_DOWNLOAD_BYTES = int(os.environ.get("MAX_PDF_DOWNLOAD_BYTES", str(300 * 1024 * 1024)))
+# برابط بيرجّع ملف ضخم يفجر الرام. القيمة الافتراضية هنا 50 ميجا.
+MAX_PDF_DOWNLOAD_BYTES = int(os.environ.get("MAX_PDF_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
 
 # عدد صفحات الـ PDF اللي بتتجمع صورها في بوست واحد.
 # مثال: PDF من 100 صفحة مع PAGES_PER_POST = 20 هيتقسم على 5 بوستات.
 PAGES_PER_POST = int(os.environ.get("PAGES_PER_POST", "20"))
 
 
-def iter_page_chunks(doc: "fitz.Document", pages_per_chunk: int):
-    """بيمشي على صفحات الـ PDF مجموعة مجموعة (زي PAGES_PER_POST)، وبيستخرج صور
-    كل مجموعة وقت الحاجة بس، من غير ما يحتفظ بصور المجموعات السابقة في الرام.
-    كل مجموعة سابقة بتتحرر من الذاكرة أوتوماتيك بمجرد ما الكود يكمل للمجموعة اللي بعدها،
-    لأن معالجتها (رفع + نشر) بتخلص قبل ما نبدأ نستخرج صور المجموعة التالية."""
-    total_pages = len(doc)
+def extract_images_by_page(pdf_bytes: bytes) -> list[list[dict]]:
+    """يرجع لستة فيها لستة صور لكل صفحة، بنفس ترتيب صفحات الـ PDF.
+    يعني index 0 = صور الصفحة الأولى، index 1 = صور الصفحة التانية، وهكذا."""
+    pages_images: list[list[dict]] = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        page_images = []
+        for img in page.get_images(full=True):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            ext = base_image.get("ext", "jpg")
+            if len(image_bytes) >= MIN_IMAGE_BYTES:
+                page_images.append({"bytes": image_bytes, "ext": ext})
+        pages_images.append(page_images)
+    doc.close()
+    return pages_images
+
+
+def chunk_pages(pages_images: list[list[dict]], pages_per_chunk: int):
+    """يقسم صور الصفحات لمجموعات، كل مجموعة بتمثل مدى صفحات (from_page, to_page, images).
+    from_page و to_page بيبدأوا من 1 (مش صفر) عشان تبقى واضحة للمستخدم."""
+    total_pages = len(pages_images)
     for start in range(0, total_pages, pages_per_chunk):
         end = min(start + pages_per_chunk, total_pages)
-        images = []
-        for page_index in range(start, end):
-            page = doc[page_index]
-            for img in page.get_images(full=True):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                ext = base_image.get("ext", "jpg")
-                if len(image_bytes) >= MIN_IMAGE_BYTES:
-                    images.append({"bytes": image_bytes, "ext": ext})
+        images = [img for page in pages_images[start:end] for img in page]
         yield {"from_page": start + 1, "to_page": end, "images": images}
 
 
@@ -172,124 +179,97 @@ def _is_user_allowed(user) -> bool:
     return not ALLOWED_USER_IDS or (user is not None and user.id in ALLOWED_USER_IDS)
 
 
-def download_pdf_to_tempfile(url: str) -> str:
-    """يحمّل PDF من رابط ويكتبه على القرص مباشرة (chunk بعد chunk) بدل ما يجمّعه
-    في الرام، عشان ملفات كبيرة (لحد 300 ميجا) متستهلكش ذاكرة زيادة أثناء التحميل.
-    بيرجع مسار الملف المؤقت. بيتأكد من نوع المحتوى الفعلي (magic bytes) بعد التحميل."""
-    # (connect timeout, read timeout) — الـ read لازم يكون كبير عشان يكفي تحميل
-    # ملفات كبيرة (لحد 300 ميجا) على اتصالات مش سريعة جدًا.
-    response = requests.get(url, stream=True, timeout=(15, 300))
+def download_pdf_from_url(url: str) -> bytes:
+    """يحمّل PDF من رابط مع حد أقصى للحجم عشان يمنع تحميل ملفات ضخمة على الرام.
+    بيتأكد من نوع المحتوى الفعلي (magic bytes) بدل ما يعتمد على الامتداد بس."""
+    response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="pdf_link_")
+    chunks = []
     total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_PDF_DOWNLOAD_BYTES:
+            raise ValueError(
+                f"حجم الملف أكبر من الحد المسموح ({MAX_PDF_DOWNLOAD_BYTES // (1024 * 1024)} ميجا)."
+            )
+        chunks.append(chunk)
+
+    data = b"".join(chunks)
+    if not data.startswith(b"%PDF"):
+        raise ValueError("الرابط ده مش بيرجّع ملف PDF فعلي.")
+    return data
+
+
+async def process_pdf(update: Update, pdf_bytes: bytes) -> None:
+    """المنطق المشترك: استخراج الصور، تقسيمها، رفعها ونشرها على فيسبوك.
+    مستخدمة سواء كان مصدر الـ PDF ملف مرفوع أو رابط."""
     try:
-        with os.fdopen(fd, "wb") as f:
-            for chunk in response.iter_content(chunk_size=256 * 1024):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_PDF_DOWNLOAD_BYTES:
-                    raise ValueError(
-                        f"حجم الملف أكبر من الحد المسموح ({MAX_PDF_DOWNLOAD_BYTES // (1024 * 1024)} ميجا)."
-                    )
-                f.write(chunk)
-
-        with open(tmp_path, "rb") as f:
-            header = f.read(4)
-        if header != b"%PDF":
-            raise ValueError("الرابط ده مش بيرجّع ملف PDF فعلي.")
-
-        return tmp_path
-    except Exception:
-        # لو حصل أي خطأ، امسح الملف الجزئي اللي اتحمّل قبل ما نرمي الاستثناء
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
-
-
-async def process_pdf(update: Update, pdf_path: str) -> None:
-    """المنطق المشترك: بيفتح الـ PDF من مساره على القرص، وبيمشي مجموعة صفحات
-    (PAGES_PER_POST) في كل مرة — يستخرج صورها، يرفعها، ينشر البوست، وبعدين
-    ينتقل للمجموعة التالية. كده صور مجموعة واحدة بس بتفضل في الرام في أي لحظة،
-    مش كل صور الملف دفعة واحدة."""
-    try:
-        doc = fitz.open(pdf_path)
+        pages_images = extract_images_by_page(pdf_bytes)
     except Exception as e:
-        logger.exception("فشل فتح الـ PDF")
+        logger.exception("فشل استخراج الصور")
         await update.message.reply_text(f"معلش، حصل خطأ في قراءة الـ PDF: {e}")
         return
 
-    total_pages = len(doc)
-    if total_pages == 0:
-        doc.close()
-        await update.message.reply_text("الملف ده فاضي من الصفحات.")
-        return
-
-    total_groups = (total_pages + PAGES_PER_POST - 1) // PAGES_PER_POST
-    await update.message.reply_text(
-        f"الملف فيه {total_pages} صفحة.\n"
-        f"هيتقسم على {total_groups} مجموعة (كل مجموعة {PAGES_PER_POST} صفحة تقريبًا)، جاري المعالجة والرفع..."
-    )
-
-    posts_created = 0
-    groups_with_images = 0
-    total_images = 0
-    total_uploaded = 0
-    upload_failed_total = 0
-    last_error = None
-
-    try:
-        for group_number, group in enumerate(iter_page_chunks(doc, PAGES_PER_POST), start=1):
-            if not group["images"]:
-                continue  # مجموعة صفحات من غير صور، تجاهلها ومتعملش بوست فاضي
-
-            groups_with_images += 1
-            total_images += len(group["images"])
-            caption = f"صفحات {group['from_page']} - {group['to_page']}"
-
-            photo_ids = []
-            group_failed = 0
-            for image in group["images"]:
-                try:
-                    photo_id = await asyncio.to_thread(
-                        upload_unpublished_photo, image["bytes"], image["ext"]
-                    )
-                    photo_ids.append(photo_id)
-                except Exception as e:
-                    logger.exception("فشل رفع صورة على فيسبوك (%s)", caption)
-                    last_error = str(e)
-                    group_failed += 1
-
-            upload_failed_total += group_failed
-            total_uploaded += len(photo_ids)
-
-            if not photo_ids:
-                continue  # كل صور المجموعة دي فشلت، منعملش بوست فاضي
-
-            for i in range(0, len(photo_ids), MAX_PHOTOS_PER_POST):
-                batch = photo_ids[i : i + MAX_PHOTOS_PER_POST]
-                try:
-                    await asyncio.to_thread(create_post_with_photos, batch, caption)
-                    posts_created += 1
-                except Exception as e:
-                    logger.exception("فشل إنشاء بوست (%s)", caption)
-                    last_error = str(e)
-
-            await update.message.reply_text(
-                f"تم معالجة المجموعة {group_number}/{total_groups} "
-                f"(صفحات {group['from_page']}-{group['to_page']}) ✅"
-            )
-    finally:
-        doc.close()
+    total_pages = len(pages_images)
+    total_images = sum(len(p) for p in pages_images)
 
     if total_images == 0:
         await update.message.reply_text("مفيش صور جوه الملف ده.")
         return
 
+    groups = list(chunk_pages(pages_images, PAGES_PER_POST))
+    # تجاهل أي مجموعة صفحات مفيش فيها صور خالص (مفيش داعي نعمل بوست فاضي)
+    groups = [g for g in groups if g["images"]]
+
+    await update.message.reply_text(
+        f"الملف فيه {total_pages} صفحة و {total_images} صورة.\n"
+        f"هيتقسم على {len(groups)} بوست (كل بوست بصور {PAGES_PER_POST} صفحة تقريبًا)، جاري الرفع..."
+    )
+
+    posts_created = 0
+    total_uploaded = 0
+    upload_failed_total = 0
+    last_error = None
+
+    for group in groups:
+        caption = f"صفحات {group['from_page']} - {group['to_page']}"
+
+        photo_ids = []
+        group_failed = 0
+        for image in group["images"]:
+            try:
+                photo_id = await asyncio.to_thread(
+                    upload_unpublished_photo, image["bytes"], image["ext"]
+                )
+                photo_ids.append(photo_id)
+            except Exception as e:
+                logger.exception("فشل رفع صورة على فيسبوك (%s)", caption)
+                last_error = str(e)
+                group_failed += 1
+
+        upload_failed_total += group_failed
+        total_uploaded += len(photo_ids)
+
+        if not photo_ids:
+            # كل صور المجموعة دي فشلت، منعملش بوست فاضي ونكمل للمجموعة اللي بعدها
+            continue
+
+        # لو مجموعة الصفحات دي لوحدها فيها صور أكتر من حد فيسبوك للبوست الواحد
+        for i in range(0, len(photo_ids), MAX_PHOTOS_PER_POST):
+            batch = photo_ids[i : i + MAX_PHOTOS_PER_POST]
+            try:
+                await asyncio.to_thread(create_post_with_photos, batch, caption)
+                posts_created += 1
+            except Exception as e:
+                logger.exception("فشل إنشاء بوست (%s)", caption)
+                last_error = str(e)
+
     summary = (
         f"تم رفع {total_uploaded} صورة من أصل {total_images}\n"
-        f"تم إنشاء {posts_created} بوست من أصل {groups_with_images} مجموعة صفحات فيها صور ✅"
+        f"تم إنشاء {posts_created} بوست من أصل {len(groups)} مجموعة صفحات ✅"
     )
     if upload_failed_total:
         summary += f"\nفشل رفع {upload_failed_total} صورة"
@@ -299,7 +279,7 @@ async def process_pdf(update: Update, pdf_path: str) -> None:
 
 
 async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يستقبل ملف PDF مرفوع مباشرة (حد تليجرام 20 ميجا للملفات المرفوعة عبر البوت)."""
+    """يستقبل ملف PDF مرفوع مباشرة."""
     user = update.message.from_user
     if not _is_user_allowed(user):
         await update.message.reply_text("معلش، مش متاح ليك تستخدم البوت ده.")
@@ -316,21 +296,16 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("ابعتلي ملف PDF بس (أو رابط PDF).")
         return
 
-    await update.message.reply_text("جاري تحميل الملف...")
+    await update.message.reply_text("جاري استخراج الصور من الملف...")
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="pdf_doc_")
-    os.close(fd)
-    try:
-        tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(tmp_path)
-        await process_pdf(update, tmp_path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    tg_file = await context.bot.get_file(document.file_id)
+    pdf_bytes = await tg_file.download_as_bytearray()
+
+    await process_pdf(update, bytes(pdf_bytes))
 
 
 async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يستقبل رسالة نصية فيها رابط PDF، يحمّله على القرص، وبعدين يعمل نفس المعالجة."""
+    """يستقبل رسالة نصية فيها رابط PDF، يحمّله، وبعدين يعمل نفس المعالجة."""
     user = update.message.from_user
     if not _is_user_allowed(user):
         await update.message.reply_text("معلش، مش متاح ليك تستخدم البوت ده.")
@@ -346,18 +321,14 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("جاري تحميل الـ PDF من الرابط...")
 
     try:
-        tmp_path = await asyncio.to_thread(download_pdf_to_tempfile, url)
+        pdf_bytes = await asyncio.to_thread(download_pdf_from_url, url)
     except Exception as e:
         logger.exception("فشل تحميل الـ PDF من الرابط")
         await update.message.reply_text(f"معلش، مقدرتش أحمّل الملف من الرابط: {e}")
         return
 
-    try:
-        await update.message.reply_text("تم التحميل، جاري المعالجة...")
-        await process_pdf(update, tmp_path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    await update.message.reply_text("تم التحميل، جاري استخراج الصور...")
+    await process_pdf(update, pdf_bytes)
 
 
 def main() -> None:
