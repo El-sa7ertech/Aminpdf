@@ -128,9 +128,6 @@ TELEGRAM_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 # سيبها فاضية لو مش عايز الخاصية دي.
 SECOND_ACCOUNT_CHAT_ID = os.environ.get("SECOND_ACCOUNT_CHAT_ID", "").strip()
 
-# chat_id اللي هتوصله رسالة "السيرفر جاهز" أول ما الـ deploy يخلص ويبدأ يشتغل.
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "1892568639").strip()
-
 # عدد محاولات إعادة التحميل لو الاتصال اتقطع في النص
 MAX_DOWNLOAD_RETRIES = 4
 RETRY_BACKOFF_SECONDS = 3  # بيتضاعف مع كل محاولة فاشلة
@@ -551,20 +548,6 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             os.remove(tmp_path)
 
 
-async def _notify_server_ready(application) -> None:
-    """بتتنادى تلقائيًا بعد ما الـ deploy يخلص والبوت يبقى جاهز يستقبل رسايل،
-    وبتبعت رسالة تأكيد على ADMIN_CHAT_ID."""
-    if not ADMIN_CHAT_ID:
-        return
-    try:
-        await application.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text="✅ السيرفر جاهز واشتغل بنجاح.",
-        )
-    except Exception:
-        logger.exception("فشل إرسال رسالة \"السيرفر جاهز\" لـ ADMIN_CHAT_ID")
-
-
 def main() -> None:
     if not WEBHOOK_URL:
         raise RuntimeError(
@@ -583,13 +566,7 @@ def main() -> None:
         write_timeout=120,
         pool_timeout=30,
     )
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .post_init(_notify_server_ready)
-        .build()
-    )
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
     app.add_handler(MessageHandler(filters.Document.ALL, handle_pdf_document))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Entity("url"), handle_pdf_link)
