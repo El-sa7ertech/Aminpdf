@@ -101,7 +101,7 @@ MAX_PDF_DOWNLOAD_BYTES = int(os.environ.get("MAX_PDF_DOWNLOAD_BYTES", str(300 * 
 
 # عدد صفحات الـ PDF اللي بتتجمع صورها في بوست واحد.
 # مثال: PDF من 100 صفحة مع PAGES_PER_POST = 20 هيتقسم على 5 بوستات.
-PAGES_PER_POST = int(os.environ.get("PAGES_PER_POST", "20"))
+PAGES_PER_POST = int(os.environ.get("PAGES_PER_POST", "60"))
 
 # chat_id بتاع حسابك التاني اللي هيوصله نسخة PDF من كل مجموعة صفحات
 # قبل ما يترفع صورها على فيسبوك. سيبها فاضية لو مش عايز الخاصية دي.
