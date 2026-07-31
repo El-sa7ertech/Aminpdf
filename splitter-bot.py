@@ -1,14 +1,14 @@
 """
-بوت تلجرام: يستقبل ملف PDF (أو رابط PDF) -> يقسمه لمجموعات صفحات -> يرجع كل
-مجموعة كملف PDF مستقل لنفس الشخص اللي بعت الملف، في نفس المحادثة.
+بوت تلجرام: يستقبل ملف PDF (أو رابط PDF) -> يستخرج كل الصور اللي جواه -> ينشرها على صفحة فيسبوك.
 
-بوت منفصل تمامًا عن بوت النشر على فيسبوك (bot-1.py) — مفيش أي تكامل مع
-فيسبوك هنا خالص، هو بس تقسيم وإرسال.
+الملف ده بيقسم الـ PDF لمجموعات من الصفحات (افتراضيًا 20 صفحة)، وكل مجموعة
+بتتنشر في بوست منفصل يجمع صور صفحاتها. يعني PDF من 100 صفحة هيتقسم على
+5 بوستات (20 صفحة لكل بوست).
 
 البوت بيقبل نوعين من المدخلات:
     1. ملف PDF مرفوع مباشرة كـ Document.
-    2. رسالة نصية فيها رابط (هيتأكد البوت من نوع المحتوى الفعلي بعد
-       التحميل بدل ما يعتمد على الامتداد بس).
+    2. رسالة نصية فيها رابط (بينتهي بـ .pdf أو أي رابط عمومًا، وهيتأكد
+       البوت من نوع المحتوى الفعلي بعد التحميل بدل ما يعتمد على الامتداد بس).
 
 نسخة Webhook — مخصصة للتشغيل على Render كـ Web Service (مش Background Worker).
 
@@ -18,44 +18,47 @@
     requests
 
 الإعدادات المطلوبة (Environment Variables في Render):
-    TELEGRAM_BOT_TOKEN   -> توكن البوت من BotFather (لازم يكون توكن مختلف عن
-                            بوت الفيسبوك، لأن كل بوت على تليجرام له توكن خاص بيه)
+    TELEGRAM_BOT_TOKEN   -> توكن البوت من BotFather
+    FB_PAGE_ID           -> ID بتاع صفحة الفيسبوك
+    FB_PAGE_ACCESS_TOKEN -> Page Access Token (long-lived) من Graph API
     WEBHOOK_URL          -> رابط السيرفس على ريندر، مثال:
                             https://your-service-name.onrender.com
     ALLOWED_USER_IDS     -> (اختياري) أرقام يوزرات تليجرام المسموح لهم، مفصولة بفاصلة
                             مثال: 123456789,987654321
-                            لو سبتها فاضية، أي حد هيقدر يستخدم البوت.
-    PAGES_PER_GROUP      -> (اختياري) عدد الصفحات في كل ملف PDF فرعي (افتراضي 20)
-    MAX_PDF_DOWNLOAD_BYTES -> (اختياري) أقصى حجم لملف PDF بيتحمل من رابط (افتراضي 300 ميجا)
-    SECOND_ACCOUNT_CHAT_ID -> (اختياري) chat_id بتاع حساب تاني على تليجرام.
-                            لو موجود، البوت هيبعتله نسخة من كل ملف فرعي زي ما بيتبعت
-                            للشخص الأصلي. سيبها فاضية لو مش عايز الخاصية دي.
+                            لو سبتها فاضية، أي حد هيقدر يستخدم البوت وينشر على صفحتك!
+    SECOND_ACCOUNT_CHAT_ID -> (اختياري) chat_id بتاع حسابك التاني على تليجرام.
+                            لو موجود، البوت هيبعتله نسخة PDF من كل مجموعة صفحات
+                            قبل ما يرفع صورها على فيسبوك. سيبها فاضية لو مش عايز الخاصية دي.
                             عشان تجيبه: ابعت أي رسالة للبوت من الحساب ده، وبعدين افتح
                             https://api.telegram.org/bot<TOKEN>/getUpdates وهتلاقي
                             الرقم جوه "chat":{"id": ...}
 
+طريقة الحصول على FB_PAGE_ACCESS_TOKEN:
+    1. اعمل Facebook App من developers.facebook.com
+    2. خد User Access Token من Graph API Explorer بصلاحية pages_manage_posts + pages_read_engagement
+    3. بدّله بـ Long-Lived Token
+    4. من /me/accounts هتجيبله Page Access Token بتاع صفحتك (ده اللي بيتحط هنا)
+
 إعداد Render:
     - Service type: Web Service (مش Background Worker)
     - Build Command:  pip install -r requirements.txt
-    - Start Command:  python splitter-bot.py
+    - Start Command:  python bot-1.py
     - لازم تحط WEBHOOK_URL = رابط السيرفس نفسه بعد ما ينعمل Deploy أول مرة
 """
 
 import os
 import io
 import re
-import gc
 import time
+import json
 import asyncio
 import logging
-import resource
 import tempfile
 import requests
 import fitz  # PyMuPDF
+from urllib.parse import urlparse, unquote
 
 from telegram import Update
-from telegram.error import TimedOut, NetworkError, RetryAfter
-from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -71,6 +74,8 @@ logger = logging.getLogger(__name__)
 
 # ---- الإعدادات ----
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT_YOUR_TELEGRAM_TOKEN_HERE")
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "PUT_YOUR_PAGE_ID_HERE")
+FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "PUT_YOUR_PAGE_ACCESS_TOKEN_HERE")
 
 # ريندر بيدي البورت في متغير البيئة PORT تلقائيًا
 PORT = int(os.environ.get("PORT", "10000"))
@@ -81,31 +86,6 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 # مسار سري بسيط للـ webhook، بيتبني من التوكن نفسه عشان محدش يقدر يخمنه
 WEBHOOK_PATH = TELEGRAM_BOT_TOKEN
 
-
-class _TokenRedactionFilter(logging.Filter):
-    """بيشيل التوكن بتاع البوت من أي رسالة لوج قبل ما تتطبع، سواء الرسالة دي
-    جاية من كودنا أو من مكتبات زي httpx/telegram اللي بتطبع الـ URL كامل
-    وقت أي طلب لـ Telegram API (زي setWebhook, editMessageText, ...)."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "PUT_YOUR_TELEGRAM_TOKEN_HERE":
-            if isinstance(record.msg, str) and TELEGRAM_BOT_TOKEN in record.msg:
-                record.msg = record.msg.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
-            if record.args:
-                record.args = tuple(
-                    arg.replace(TELEGRAM_BOT_TOKEN, "***TOKEN***")
-                    if isinstance(arg, str) and TELEGRAM_BOT_TOKEN in arg
-                    else arg
-                    for arg in record.args
-                )
-        return True
-
-
-_token_filter = _TokenRedactionFilter()
-logging.getLogger().addFilter(_token_filter)
-for _handler in logging.getLogger().handlers:
-    _handler.addFilter(_token_filter)
-
 # قائمة اليوزرات المسموح لهم يستخدموا البوت (لو فاضية = الكل مسموح، مش موصى بيه)
 ALLOWED_USER_IDS = {
     int(uid.strip())
@@ -113,29 +93,230 @@ ALLOWED_USER_IDS = {
     if uid.strip().isdigit()
 }
 
+MIN_IMAGE_BYTES = 3000  # علشان نتجاهل صور صغيرة جدًا (أيقونات/خطوط مدمجة)
+
 # حد أقصى لحجم أي PDF بيتحمل من رابط (بالبايت)، عشان مايبقاش فيه استغلال
-# برابط بيرجّع ملف ضخم يفجر الرام. القيمة الافتراضية هنا 300 ميجا.
+# برابط بيرجّع ملف ضخم يفجر الرام. القيمة الافتراضية هنا 300 ميجا
+# (البوت لاستخدام شخصي، فمفيش داعي لحد صغير زي حالة البوت العام).
 MAX_PDF_DOWNLOAD_BYTES = int(os.environ.get("MAX_PDF_DOWNLOAD_BYTES", str(300 * 1024 * 1024)))
 
-# عدد الصفحات في كل ملف PDF فرعي.
-# مثال: PDF من 100 صفحة مع PAGES_PER_GROUP = 20 هيتقسم على 5 ملفات.
-PAGES_PER_GROUP = int(os.environ.get("PAGES_PER_GROUP", "20"))
+# عدد صفحات الـ PDF اللي بتتجمع صورها في بوست واحد.
+# مثال: PDF من 100 صفحة مع PAGES_PER_POST = 20 هيتقسم على 5 بوستات.
+PAGES_PER_POST = int(os.environ.get("PAGES_PER_POST", "60"))
+
+# chat_id بتاع حسابك التاني اللي هيوصله نسخة PDF من كل مجموعة صفحات
+# قبل ما يترفع صورها على فيسبوك. سيبها فاضية لو مش عايز الخاصية دي.
+SECOND_ACCOUNT_CHAT_ID = os.environ.get("SECOND_ACCOUNT_CHAT_ID", "").strip()
 
 # حد تليجرام لحجم أي ملف بيتبعت من البوت (50 ميجا)
 TELEGRAM_MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 
-# chat_id بتاع حساب تاني اللي هيوصله نسخة من كل ملف فرعي بعد ما يترسل للشخص الأصلي.
-# سيبها فاضية لو مش عايز الخاصية دي.
-SECOND_ACCOUNT_CHAT_ID = os.environ.get("SECOND_ACCOUNT_CHAT_ID", "").strip()
 
-# chat_id اللي هتوصله رسالة "السيرفر جاهز" أول ما الـ deploy يخلص ويبدأ يشتغل.
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "1892568639").strip()
+def iter_page_chunks(doc: "fitz.Document", pages_per_chunk: int):
+    """بيمشي على صفحات الـ PDF مجموعة مجموعة (زي PAGES_PER_POST)، وبيستخرج صور
+    كل مجموعة وقت الحاجة بس، من غير ما يحتفظ بصور المجموعات السابقة في الرام.
+    كل مجموعة سابقة بتتحرر من الذاكرة أوتوماتيك بمجرد ما الكود يكمل للمجموعة اللي بعدها،
+    لأن معالجتها (رفع + نشر) بتخلص قبل ما نبدأ نستخرج صور المجموعة التالية."""
+    total_pages = len(doc)
+    for start in range(0, total_pages, pages_per_chunk):
+        end = min(start + pages_per_chunk, total_pages)
+        images = []
+        for page_index in range(start, end):
+            page = doc[page_index]
+            for img in page.get_images(full=True):
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                ext = base_image.get("ext", "jpg")
+                if len(image_bytes) >= MIN_IMAGE_BYTES:
+                    images.append({"bytes": image_bytes, "ext": ext})
+        yield {"from_page": start + 1, "to_page": end, "images": images}
+
+
+def build_pdf_chunk_bytes(doc: "fitz.Document", from_page: int, to_page: int) -> bytes:
+    """بيبني ملف PDF مستقل يحتوي بس على نطاق الصفحات ده (from_page/to_page أرقام
+    مبنية على 1)، وبيرجعه كـ bytes جاهزة للإرسال. مبيلمسش الملف الأصلي."""
+    chunk_doc = fitz.open()
+    try:
+        chunk_doc.insert_pdf(doc, from_page=from_page - 1, to_page=to_page - 1)
+        return chunk_doc.tobytes()
+    finally:
+        chunk_doc.close()
+
+
+async def send_chunk_to_second_account(
+    context: ContextTypes.DEFAULT_TYPE,
+    pdf_bytes: bytes,
+    from_page: int,
+    to_page: int,
+    pdf_name: str = "",
+) -> None:
+    """بيبعت نطاق الصفحات كملف PDF لحسابك التاني (SECOND_ACCOUNT_CHAT_ID)،
+    لو الإعداد ده مش فاضي. بيتنادى قبل ما يترفع صور المجموعة على فيسبوك."""
+    if not SECOND_ACCOUNT_CHAT_ID:
+        return
+
+    if len(pdf_bytes) > TELEGRAM_MAX_DOCUMENT_BYTES:
+        logger.warning(
+            "مجموعة الصفحات %s-%s حجمها أكبر من حد تليجرام (50 ميجا)، مش هتترسل للحساب التاني",
+            from_page,
+            to_page,
+        )
+        return
+
+    caption = f"صفحات {from_page} - {to_page}"
+    if pdf_name:
+        caption = f"{pdf_name}\n{caption}"
+
+    try:
+        await context.bot.send_document(
+            chat_id=SECOND_ACCOUNT_CHAT_ID,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"pages_{from_page}-{to_page}.pdf",
+            caption=caption,
+        )
+    except Exception:
+        logger.exception(
+            "فشل إرسال مجموعة الصفحات %s-%s للحساب التاني", from_page, to_page
+        )
+
+
+# أقصى عدد صور في البوست الواحد (فيسبوك بيحدد حد أقصى).
+# ده استخدامه كحماية إضافية جوه كل مجموعة صفحات: لو مجموعة الـ 20 صفحة
+# نفسها فيها صور أكتر من الحد ده (نادر)، بتتقسم على أكتر من بوست.
+MAX_PHOTOS_PER_POST = 100
+
+
+# --- حماية من Rate Limit بتاع Graph API ---
+# لو فيسبوك رجّع أي كود من دول (أو HTTP 429)، معناه إحنا بنبعت طلبات كتير
+# بسرعة وهو بيرفض مؤقتًا. الأكواد دي معروفة ومكررة في توثيق Graph API:
+#   4   -> Application request limit reached (rate limit عام على مستوى الـ app)
+#   17  -> User request limit reached
+#   32  -> Page request limit reached
+#   613 -> Calls to this API have exceeded the rate limit
+FB_RATE_LIMIT_ERROR_CODES = {4, 17, 32, 613}
+
+MAX_FB_RETRIES = 5
+FB_RETRY_BACKOFF_SECONDS = 5  # بيتضاعف مع كل محاولة (5, 10, 20, 40, ...)
+
+
+class FacebookRateLimitError(Exception):
+    """بيترمى لما فيسبوك يرفض الطلب بسبب rate limit حتى بعد كل المحاولات."""
+
+
+def _fb_error_info(response: requests.Response) -> dict:
+    try:
+        return response.json().get("error", {})
+    except ValueError:
+        return {"message": response.text}
+
+
+def _is_fb_rate_limit(response: requests.Response, fb_error: dict) -> bool:
+    if response.status_code == 429:
+        return True
+    code = fb_error.get("code")
+    return code in FB_RATE_LIMIT_ERROR_CODES
+
+
+def _fb_request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """بيعمل نفس طلب requests العادي، لكن لو فيسبوك رجّع rate limit بيستنى وبيعيد
+    المحاولة (backoff تصاعدي)، وبيحترم هيدر Retry-After لو فيسبوك بعته."""
+    attempt = 0
+    while True:
+        attempt += 1
+        response = requests.request(method, url, **kwargs)
+
+        if response.ok:
+            return response
+
+        fb_error = _fb_error_info(response)
+
+        if _is_fb_rate_limit(response, fb_error):
+            if attempt >= MAX_FB_RETRIES:
+                logger.error(
+                    "فيسبوك rate limit مستمر بعد %s محاولات | code=%s | message=%s",
+                    MAX_FB_RETRIES,
+                    fb_error.get("code"),
+                    fb_error.get("message"),
+                )
+                raise FacebookRateLimitError(
+                    fb_error.get("message", "تم تجاوز حد الطلبات المسموح به من فيسبوك.")
+                )
+
+            retry_after = response.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                wait_seconds = int(retry_after)
+            else:
+                wait_seconds = FB_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+
+            logger.warning(
+                "فيسبوك رجّع rate limit (محاولة %s/%s) | code=%s | هنستنى %s ثانية",
+                attempt,
+                MAX_FB_RETRIES,
+                fb_error.get("code"),
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        # خطأ تاني مش rate limit -> يتعامل بيه زي ما كان (يتسجل ويترمى فورًا)
+        _log_fb_error(response, fb_error)
+        response.raise_for_status()
+
+
+def upload_unpublished_photo(image_bytes: bytes, ext: str) -> str:
+    """يرفع صورة كـ 'غير منشورة' على فيسبوك ويرجع الـ photo_id بتاعها من غير ما تظهر كبوست مستقل."""
+    url = f"https://graph.facebook.com/{FB_PAGE_ID}/photos"
+    files = {"source": (f"image.{ext}", io.BytesIO(image_bytes))}
+    data = {
+        "published": "false",
+        "access_token": FB_PAGE_ACCESS_TOKEN,
+    }
+    response = _fb_request_with_retry("POST", url, files=files, data=data, timeout=60)
+    return response.json()["id"]
+
+
+def create_post_with_photos(photo_ids: list[str], caption: str = "") -> dict:
+    """يعمل بوست واحد يجمع كل الصور اللي معاها photo_id من الدالة اللي فوق."""
+    url = f"https://graph.facebook.com/{FB_PAGE_ID}/feed"
+    data = {
+        "message": caption,
+        "access_token": FB_PAGE_ACCESS_TOKEN,
+    }
+    for i, photo_id in enumerate(photo_ids):
+        data[f"attached_media[{i}]"] = json.dumps({"media_fbid": photo_id})
+    response = _fb_request_with_retry("POST", url, data=data, timeout=60)
+    return response.json()
+
+
+def _log_fb_error(response: requests.Response, fb_error: dict) -> None:
+    """يطبع رسالة الخطأ الحقيقية من فيسبوك في اللوج."""
+    logger.error(
+        "فيسبوك رفض الطلب | status=%s | code=%s | subcode=%s | message=%s",
+        response.status_code,
+        fb_error.get("code"),
+        fb_error.get("error_subcode"),
+        fb_error.get("message"),
+    )
+
+
+def _raise_with_fb_error(response: requests.Response) -> None:
+    """محتفظ بيها لأي استخدام قديم: بتطبع الخطأ وترمي استثناء عادي."""
+    if not response.ok:
+        _log_fb_error(response, _fb_error_info(response))
+        response.raise_for_status()
+
+
+def _is_user_allowed(user) -> bool:
+    return not ALLOWED_USER_IDS or (user is not None and user.id in ALLOWED_USER_IDS)
+
 
 # عدد محاولات إعادة التحميل لو الاتصال اتقطع في النص
 MAX_DOWNLOAD_RETRIES = 4
 RETRY_BACKOFF_SECONDS = 3  # بيتضاعف مع كل محاولة فاشلة
 
 # بعض السيرفرات بترفض الطلبات اللي مالهاش User-Agent شبه متصفح حقيقي
+# (بتفتكرها بوت/سكريبت وترفضها بـ 400/403). بنبعت هيدر شبه متصفح عادي.
 DOWNLOAD_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -145,14 +326,17 @@ DOWNLOAD_HEADERS = {
 }
 
 
-def _is_user_allowed(user) -> bool:
-    return not ALLOWED_USER_IDS or (user is not None and user.id in ALLOWED_USER_IDS)
-
-
 def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
-    """يحمّل PDF من رابط ويكتبه على القرص مباشرة (chunk بعد chunk)، ويتأكد
-    من نوع المحتوى الفعلي (magic bytes) بعد التحميل. بيدعم استئناف التحميل
-    (Range requests) لو الاتصال انقطع، ويعيد المحاولة لحد MAX_DOWNLOAD_RETRIES."""
+    """يحمّل PDF من رابط ويكتبه على القرص مباشرة (chunk بعد chunk) بدل ما يجمّعه
+    في الرام، عشان ملفات كبيرة (لحد 300 ميجا) متستهلكش ذاكرة زيادة أثناء التحميل.
+    بيرجع مسار الملف المؤقت. بيتأكد من نوع المحتوى الفعلي (magic bytes) بعد التحميل.
+
+    لو اتبعت progress_callback، بيتنادى بشكل دوري بـ (downloaded_bytes, total_bytes)
+    — total_bytes بتبقى None لو السيرفر مش راجع Content-Length.
+
+    لو الاتصال انقطع في النص (مشكلة شبكة شائعة مع الملفات الكبيرة)، بيحاول تاني
+    لحد MAX_DOWNLOAD_RETRIES مرات. لو السيرفر بيدعم Range requests (Accept-Ranges: bytes)
+    بيكمل من نفس النقطة اللي اتقطعت عندها بدل ما يعيد تحميل الملف من الأول."""
     tmp_path = None
     downloaded = 0
     total_size = None
@@ -160,7 +344,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
     last_report_time = 0.0
     last_report_bytes = 0
     REPORT_EVERY_SECONDS = 2.0
-    REPORT_EVERY_BYTES = 5 * 1024 * 1024
+    REPORT_EVERY_BYTES = 5 * 1024 * 1024  # أو كل 5 ميجا، أيهما أقرب
 
     attempt = 0
     try:
@@ -172,9 +356,12 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
                 headers["Range"] = f"bytes={downloaded}-"
 
             try:
+                # (connect timeout, read timeout) — الـ read لازم يكون كبير عشان يكفي
+                # تحميل ملفات كبيرة (لحد 300 ميجا) على اتصالات مش سريعة جدًا.
                 response = requests.get(url, stream=True, timeout=(15, 300), headers=headers)
 
                 if resume and response.status_code != 206:
+                    # السيرفر ماستجابش لطلب الاستئناف، لازم نبدأ من الأول تاني
                     response.close()
                     downloaded = 0
                     if tmp_path and os.path.exists(tmp_path):
@@ -222,7 +409,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
                                 except Exception:
                                     logger.exception("فشل استدعاء progress_callback")
 
-                break
+                break  # التحميل خلص بنجاح، اخرج من حلقة إعادة المحاولة
 
             except (
                 requests.exceptions.ChunkedEncodingError,
@@ -246,7 +433,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
 
         if progress_callback:
             try:
-                progress_callback(downloaded, total_size)
+                progress_callback(downloaded, total_size)  # تقرير أخير بعد ما يخلص
             except Exception:
                 logger.exception("فشل استدعاء progress_callback")
 
@@ -257,115 +444,19 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
 
         return tmp_path
     except Exception:
+        # لو حصل أي خطأ نهائي، امسح الملف الجزئي اللي اتحمّل قبل ما نرمي الاستثناء
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
 
 
-def _log_memory_usage(context_label: str) -> None:
-    """بيسجل بالـ logs أعلى استهلاك رام وصلت له العملية لحد دلوقتي (بالميجا).
-    مفيد جدًا عشان تشوف بالـ logs بتاعة Render هل الرام بتزيد بشكل متراكم مع
-    كل جزء ولا لأ (لو بتزيد باستمرار من غير ما تنزل، ده مؤشر على مشكلة
-    OOM محتملة قبل ما تحصل فعليًا)."""
-    try:
-        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        logger.info("استهلاك الرام (peak) بعد %s: %.1f ميجا", context_label, peak_kb / 1024)
-    except Exception:
-        pass
-
-
-
-def build_pdf_chunk_bytes(doc, from_page: int, to_page: int) -> bytes:
-    """بيبني ملف PDF مستقل يحتوي بس على نطاق الصفحات ده (from_page/to_page أرقام
-    مبنية على 1)، وبيرجعه كـ bytes جاهزة للإرسال. مبيلمسش الملف الأصلي."""
-    chunk_doc = fitz.open()
-    try:
-        chunk_doc.insert_pdf(doc, from_page=from_page - 1, to_page=to_page - 1)
-        return chunk_doc.tobytes()
-    finally:
-        chunk_doc.close()
-
-
-async def send_chunk_to_second_account(
-    context: ContextTypes.DEFAULT_TYPE,
-    pdf_bytes: bytes,
-    from_page: int,
-    to_page: int,
+async def process_pdf(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str, pdf_name: str = ""
 ) -> None:
-    """بيبعت نسخة من ملف الصفحات دي لحسابك التاني (SECOND_ACCOUNT_CHAT_ID)،
-    لو الإعداد ده مش فاضي. بيتنادى بعد ما يترسل الملف للشخص الأصلي."""
-    if not SECOND_ACCOUNT_CHAT_ID:
-        return
-
-    if len(pdf_bytes) > TELEGRAM_MAX_DOCUMENT_BYTES:
-        logger.warning(
-            "مجموعة الصفحات %s-%s حجمها أكبر من حد تليجرام (50 ميجا)، مش هتترسل للحساب التاني",
-            from_page,
-            to_page,
-        )
-        return
-
-    try:
-        await context.bot.send_document(
-            chat_id=SECOND_ACCOUNT_CHAT_ID,
-            document=io.BytesIO(pdf_bytes),
-            filename=f"pages_{from_page}-{to_page}.pdf",
-            caption=f"صفحات {from_page} - {to_page}",
-        )
-    except Exception:
-        logger.exception(
-            "فشل إرسال مجموعة الصفحات %s-%s للحساب التاني", from_page, to_page
-        )
-
-
-# عدد محاولات إعادة إرسال الملف لو حصل Timeout أثناء الرفع لتليجرام
-MAX_SEND_RETRIES = 3
-SEND_RETRY_BACKOFF_SECONDS = 5  # بيتضاعف مع كل محاولة (5, 10, ...)
-
-
-async def _reply_document_with_retry(
-    update: Update, pdf_bytes: bytes, filename: str, caption: str
-):
-    """بيبعت الملف للمستخدم، ولو حصل Timeout (شائع مع الملفات الكبيرة أو النت
-    البطيء) بيعيد المحاولة قبل ما يستسلم."""
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            await update.message.reply_document(
-                document=io.BytesIO(pdf_bytes),
-                filename=filename,
-                caption=caption,
-            )
-            return
-        except RetryAfter as e:
-            # تليجرام نفسه بيقول لازم تستنى كام ثانية بالظبط قبل ما تعيد المحاولة
-            wait_seconds = e.retry_after + 1
-            logger.warning(
-                "تليجرام طلب الانتظار (flood control) في إرسال %s، هنستنى %s ثانية",
-                filename,
-                wait_seconds,
-            )
-            await asyncio.sleep(wait_seconds)
-            continue
-        except (TimedOut, NetworkError) as e:
-            if attempt >= MAX_SEND_RETRIES:
-                raise
-            wait_seconds = SEND_RETRY_BACKOFF_SECONDS * attempt
-            logger.warning(
-                "تايم أوت في إرسال %s (محاولة %s/%s)، هنستنى %s ثانية ونعيد",
-                filename,
-                attempt,
-                MAX_SEND_RETRIES,
-                wait_seconds,
-            )
-            await asyncio.sleep(wait_seconds)
-            continue
-
-
-async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str) -> None:
-    """بيفتح الـ PDF من مساره على القرص، ويقسمه لمجموعات صفحات (PAGES_PER_GROUP)،
-    وبيبعت كل مجموعة كملف PDF مستقل رد في نفس المحادثة اللي جت منها."""
+    """المنطق المشترك: بيفتح الـ PDF من مساره على القرص، وبيمشي مجموعة صفحات
+    (PAGES_PER_POST) في كل مرة — يستخرج صورها، يرفعها، ينشر البوست، وبعدين
+    ينتقل للمجموعة التالية. كده صور مجموعة واحدة بس بتفضل في الرام في أي لحظة،
+    مش كل صور الملف دفعة واحدة."""
     try:
         doc = fitz.open(pdf_path)
     except Exception as e:
@@ -379,95 +470,106 @@ async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_pa
         await update.message.reply_text("الملف ده فاضي من الصفحات.")
         return
 
-    _log_memory_usage("فتح الملف (قبل بداية التقسيم)")
-
-    total_groups = (total_pages + PAGES_PER_GROUP - 1) // PAGES_PER_GROUP
+    total_groups = (total_pages + PAGES_PER_POST - 1) // PAGES_PER_POST
+    name_line = f"الملف: {pdf_name}\n" if pdf_name else ""
     await update.message.reply_text(
-        f"الملف فيه {total_pages} صفحة.\n"
-        f"هيتقسم على {total_groups} ملف (كل ملف {PAGES_PER_GROUP} صفحة تقريبًا)، جاري القص والإرسال..."
+        f"{name_line}الملف فيه {total_pages} صفحة.\n"
+        f"هيتقسم على {total_groups} مجموعة (كل مجموعة {PAGES_PER_POST} صفحة تقريبًا)، جاري المعالجة والرفع..."
     )
 
-    sent_count = 0
-    failed_count = 0
+    posts_created = 0
+    groups_with_images = 0
+    total_images = 0
+    total_uploaded = 0
+    upload_failed_total = 0
     last_error = None
 
     try:
-        for group_number in range(1, total_groups + 1):
-            from_page = (group_number - 1) * PAGES_PER_GROUP + 1
-            to_page = min(group_number * PAGES_PER_GROUP, total_pages)
+        # --- المرحلة 1: إرسال كل مجموعات الصفحات كملفات PDF للحساب التاني أولًا ---
+        # بتخلص المرحلة دي بالكامل (كل المجموعات) قبل ما نبدأ أي نشر على فيسبوك.
+        if SECOND_ACCOUNT_CHAT_ID:
+            await update.message.reply_text(
+                f"جاري إرسال كل المجموعات ({total_groups}) للحساب التاني..."
+            )
+            for group_number, group in enumerate(
+                iter_page_chunks(doc, PAGES_PER_POST), start=1
+            ):
+                try:
+                    chunk_bytes = await asyncio.to_thread(
+                        build_pdf_chunk_bytes, doc, group["from_page"], group["to_page"]
+                    )
+                    await send_chunk_to_second_account(
+                        context, chunk_bytes, group["from_page"], group["to_page"], pdf_name
+                    )
+                except Exception:
+                    logger.exception(
+                        "فشل بناء/إرسال نسخة PDF من المجموعة %s-%s للحساب التاني",
+                        group["from_page"],
+                        group["to_page"],
+                    )
+            await update.message.reply_text(
+                "تم إرسال كل المجموعات للحساب التاني ✅\nجاري بدء النشر على فيسبوك..."
+            )
 
-            try:
-                chunk_bytes = await asyncio.to_thread(
-                    build_pdf_chunk_bytes, doc, from_page, to_page
-                )
-            except Exception as e:
-                logger.exception("فشل قص نطاق الصفحات %s-%s", from_page, to_page)
-                failed_count += 1
-                last_error = str(e)
-                continue
+        # --- المرحلة 2: الرجوع من البداية والنشر على فيسبوك مجموعة مجموعة ---
+        for group_number, group in enumerate(iter_page_chunks(doc, PAGES_PER_POST), start=1):
+            if not group["images"]:
+                continue  # مجموعة صفحات من غير صور، تجاهلها ومتعملش بوست فاضي على فيسبوك
 
-            if len(chunk_bytes) > TELEGRAM_MAX_DOCUMENT_BYTES:
-                logger.warning(
-                    "نطاق الصفحات %s-%s حجمه أكبر من حد تليجرام (50 ميجا)، هيتم تجاهله",
-                    from_page,
-                    to_page,
-                )
-                failed_count += 1
-                last_error = (
-                    f"مجموعة الصفحات {from_page}-{to_page} حجمها أكبر من 50 ميجا "
-                    "(حد تليجرام الأقصى لأي ملف)."
-                )
-                continue
+            groups_with_images += 1
+            total_images += len(group["images"])
+            if pdf_name:
+                caption = f"{pdf_name}\nصفحات {group['from_page']} - {group['to_page']}"
+            else:
+                caption = f"صفحات {group['from_page']} - {group['to_page']}"
 
-            try:
-                await _reply_document_with_retry(
-                    update,
-                    chunk_bytes,
-                    filename=f"pages_{from_page}-{to_page}.pdf",
-                    caption=f"صفحات {from_page} - {to_page} ({group_number}/{total_groups})",
-                )
-                sent_count += 1
-            except Exception as e:
-                logger.exception("فشل إرسال نطاق الصفحات %s-%s", from_page, to_page)
-                failed_count += 1
-                last_error = str(e)
-                continue
+            photo_ids = []
+            group_failed = 0
+            for image in group["images"]:
+                try:
+                    photo_id = await asyncio.to_thread(
+                        upload_unpublished_photo, image["bytes"], image["ext"]
+                    )
+                    photo_ids.append(photo_id)
+                except Exception as e:
+                    logger.exception("فشل رفع صورة على فيسبوك (%s)", caption)
+                    last_error = str(e)
+                    group_failed += 1
 
-            await send_chunk_to_second_account(context, chunk_bytes, from_page, to_page)
+            upload_failed_total += group_failed
+            total_uploaded += len(photo_ids)
 
-            try:
-                await update.message.reply_text(
-                    f"تم إرسال الملف {group_number}/{total_groups} "
-                    f"(صفحات {from_page}-{to_page}) ✅"
-                )
-            except RetryAfter as e:
-                logger.warning(
-                    "فلود كنترول على رسالة التأكيد، هنستنى %s ثانية", e.retry_after
-                )
-                await asyncio.sleep(e.retry_after + 1)
-            except Exception:
-                # رسالة التأكيد مش أساسية، لو فشلت منكملش نوقف عملية الإرسال كلها بسببها
-                logger.exception(
-                    "فشل إرسال رسالة تأكيد الجزء %s-%s، هنكمل عادي", from_page, to_page
-                )
+            if not photo_ids:
+                continue  # كل صور المجموعة دي فشلت، منعملش بوست فاضي
 
-            # تنظيف ذاكرة صريح بعد كل جزء + تسجيل استهلاك الرام الحالي بالـ logs
-            # عشان تقدر تتابع على Render هل فيه تراكم رام مع الأجزاء ولا لأ
-            del chunk_bytes
-            gc.collect()
-            _log_memory_usage(f"الجزء {group_number}/{total_groups}")
+            for i in range(0, len(photo_ids), MAX_PHOTOS_PER_POST):
+                batch = photo_ids[i : i + MAX_PHOTOS_PER_POST]
+                try:
+                    await asyncio.to_thread(create_post_with_photos, batch, caption)
+                    posts_created += 1
+                except Exception as e:
+                    logger.exception("فشل إنشاء بوست (%s)", caption)
+                    last_error = str(e)
 
-            # تأخير بسيط بين كل جزء وبعده عشان نتجنب حد الفلود بتاع تليجرام
-            # (خصوصًا مع ملفات فيها أجزاء كتير زي دي)
-            await asyncio.sleep(1.2)
+            await update.message.reply_text(
+                f"تم معالجة المجموعة {group_number}/{total_groups} "
+                f"(صفحات {group['from_page']}-{group['to_page']}) ✅"
+            )
     finally:
         doc.close()
 
-    summary = f"تم إرسال {sent_count} ملف من أصل {total_groups} ✅"
-    if failed_count:
-        summary += f"\nفشل إرسال {failed_count} ملف"
-        if last_error:
-            summary += f"\n\nآخر خطأ:\n{last_error}"
+    if total_images == 0:
+        await update.message.reply_text("مفيش صور جوه الملف ده.")
+        return
+
+    summary = (
+        f"تم رفع {total_uploaded} صورة من أصل {total_images}\n"
+        f"تم إنشاء {posts_created} بوست من أصل {groups_with_images} مجموعة صفحات فيها صور ✅"
+    )
+    if upload_failed_total:
+        summary += f"\nفشل رفع {upload_failed_total} صورة"
+    if last_error and posts_created == 0:
+        summary += f"\n\nآخر خطأ:\n{last_error}"
     await update.message.reply_text(summary)
 
 
@@ -496,7 +598,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(tmp_path)
-        await process_pdf(update, context, tmp_path)
+        await process_pdf(update, context, tmp_path, pdf_name=file_name)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -526,13 +628,14 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             total_mb = total_size / (1024 * 1024)
             text = f"جاري تحميل الـ PDF... {percent}% ({downloaded_mb:.1f} / {total_mb:.1f} ميجا)"
         else:
+            # السيرفر مش راجع حجم الملف الكلي، فبنعرض بس اللي اتحمّل لحد دلوقتي
             text = f"جاري تحميل الـ PDF... {downloaded_mb:.1f} ميجا"
 
         async def _edit():
             try:
                 await progress_msg.edit_text(text)
             except Exception:
-                pass
+                pass  # تجاهل أخطاء rate limit البسيطة بتاعة تعديل الرسالة
 
         asyncio.run_coroutine_threadsafe(_edit(), loop)
 
@@ -543,26 +646,16 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await progress_msg.edit_text(f"معلش، مقدرتش أحمّل الملف من الرابط: {e}")
         return
 
+    # استخراج اسم الملف من الرابط نفسه (آخر جزء في المسار)، لو موجود
+    url_path_name = os.path.basename(urlparse(url).path)
+    pdf_name = unquote(url_path_name) if url_path_name else ""
+
     try:
-        await progress_msg.edit_text("تم التحميل، جاري القص والإرسال...")
-        await process_pdf(update, context, tmp_path)
+        await progress_msg.edit_text("تم التحميل، جاري المعالجة...")
+        await process_pdf(update, context, tmp_path, pdf_name=pdf_name)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-
-
-async def _notify_server_ready(application) -> None:
-    """بتتنادى تلقائيًا بعد ما الـ deploy يخلص والبوت يبقى جاهز يستقبل رسايل،
-    وبتبعت رسالة تأكيد على ADMIN_CHAT_ID."""
-    if not ADMIN_CHAT_ID:
-        return
-    try:
-        await application.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text="✅ السيرفر جاهز واشتغل بنجاح.",
-        )
-    except Exception:
-        logger.exception("فشل إرسال رسالة \"السيرفر جاهز\" لـ ADMIN_CHAT_ID")
 
 
 def main() -> None:
@@ -571,25 +664,18 @@ def main() -> None:
             "لازم تحط WEBHOOK_URL في الـ Environment Variables (رابط السيرفس على ريندر)."
         )
 
+    # مكتبة python-telegram-bot بتعتمد جوّاها على asyncio.get_event_loop()
+    # وده اتغير سلوكه في بايثون 3.14 وبقى بيرمي RuntimeError لو مفيش loop
+    # متظبط للـ thread الحالي مسبقًا. الحل: نظبطه إحنا بأنفسنا قبل ما نستدعي
+    # run_webhook()، عشان الكود يشتغل على أي نسخة بايثون من غير ما نعتمد
+    # على إعدادات ريندر الخارجية.
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=120,
-        write_timeout=120,
-        pool_timeout=30,
-    )
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .post_init(_notify_server_ready)
-        .build()
-    )
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.Document.ALL, handle_pdf_document))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Entity("url"), handle_pdf_link)
