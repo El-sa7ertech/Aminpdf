@@ -56,7 +56,6 @@ import logging
 import tempfile
 import requests
 import fitz  # PyMuPDF
-from urllib.parse import urlparse, unquote
 
 from telegram import Update
 from telegram.ext import (
@@ -149,7 +148,6 @@ async def send_chunk_to_second_account(
     pdf_bytes: bytes,
     from_page: int,
     to_page: int,
-    pdf_name: str = "",
 ) -> None:
     """بيبعت نطاق الصفحات كملف PDF لحسابك التاني (SECOND_ACCOUNT_CHAT_ID)،
     لو الإعداد ده مش فاضي. بيتنادى قبل ما يترفع صور المجموعة على فيسبوك."""
@@ -164,16 +162,12 @@ async def send_chunk_to_second_account(
         )
         return
 
-    caption = f"صفحات {from_page} - {to_page}"
-    if pdf_name:
-        caption = f"{pdf_name}\n{caption}"
-
     try:
         await context.bot.send_document(
             chat_id=SECOND_ACCOUNT_CHAT_ID,
             document=io.BytesIO(pdf_bytes),
             filename=f"pages_{from_page}-{to_page}.pdf",
-            caption=caption,
+            caption=f"صفحات {from_page} - {to_page}",
         )
     except Exception:
         logger.exception(
@@ -451,7 +445,7 @@ def download_pdf_to_tempfile(url: str, progress_callback=None) -> str:
 
 
 async def process_pdf(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str, pdf_name: str = ""
+    update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_path: str
 ) -> None:
     """المنطق المشترك: بيفتح الـ PDF من مساره على القرص، وبيمشي مجموعة صفحات
     (PAGES_PER_POST) في كل مرة — يستخرج صورها، يرفعها، ينشر البوست، وبعدين
@@ -471,9 +465,8 @@ async def process_pdf(
         return
 
     total_groups = (total_pages + PAGES_PER_POST - 1) // PAGES_PER_POST
-    name_line = f"الملف: {pdf_name}\n" if pdf_name else ""
     await update.message.reply_text(
-        f"{name_line}الملف فيه {total_pages} صفحة.\n"
+        f"الملف فيه {total_pages} صفحة.\n"
         f"هيتقسم على {total_groups} مجموعة (كل مجموعة {PAGES_PER_POST} صفحة تقريبًا)، جاري المعالجة والرفع..."
     )
 
@@ -499,7 +492,7 @@ async def process_pdf(
                         build_pdf_chunk_bytes, doc, group["from_page"], group["to_page"]
                     )
                     await send_chunk_to_second_account(
-                        context, chunk_bytes, group["from_page"], group["to_page"], pdf_name
+                        context, chunk_bytes, group["from_page"], group["to_page"]
                     )
                 except Exception:
                     logger.exception(
@@ -518,10 +511,7 @@ async def process_pdf(
 
             groups_with_images += 1
             total_images += len(group["images"])
-            if pdf_name:
-                caption = f"{pdf_name}\nصفحات {group['from_page']} - {group['to_page']}"
-            else:
-                caption = f"صفحات {group['from_page']} - {group['to_page']}"
+            caption = f"صفحات {group['from_page']} - {group['to_page']}"
 
             photo_ids = []
             group_failed = 0
@@ -598,7 +588,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(tmp_path)
-        await process_pdf(update, context, tmp_path, pdf_name=file_name)
+        await process_pdf(update, context, tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -646,13 +636,9 @@ async def handle_pdf_link(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await progress_msg.edit_text(f"معلش، مقدرتش أحمّل الملف من الرابط: {e}")
         return
 
-    # استخراج اسم الملف من الرابط نفسه (آخر جزء في المسار)، لو موجود
-    url_path_name = os.path.basename(urlparse(url).path)
-    pdf_name = unquote(url_path_name) if url_path_name else ""
-
     try:
         await progress_msg.edit_text("تم التحميل، جاري المعالجة...")
-        await process_pdf(update, context, tmp_path, pdf_name=pdf_name)
+        await process_pdf(update, context, tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
