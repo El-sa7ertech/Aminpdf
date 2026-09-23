@@ -579,10 +579,7 @@ async def process_pdf(
     await update.message.reply_text(summary)
 
     if post_links:
-        name_suffix = f"\n{pdf_name}" if pdf_name else ""
-        links_text = "روابط البوستات:\n" + "\n".join(
-            f"{link}{name_suffix}" for link in post_links
-        )
+        links_text = "روابط البوستات:\n" + "\n".join(post_links)
         await update.message.reply_text(links_text)
 
 
