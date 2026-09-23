@@ -483,7 +483,6 @@ async def process_pdf(
     total_uploaded = 0
     upload_failed_total = 0
     last_error = None
-    post_links = []
 
     try:
         # --- المرحلة 1: إرسال كل مجموعات الصفحات كملفات PDF للحساب التاني أولًا ---
@@ -546,13 +545,8 @@ async def process_pdf(
             for i in range(0, len(photo_ids), MAX_PHOTOS_PER_POST):
                 batch = photo_ids[i : i + MAX_PHOTOS_PER_POST]
                 try:
-                    post_result = await asyncio.to_thread(create_post_with_photos, batch, caption)
+                    await asyncio.to_thread(create_post_with_photos, batch, caption)
                     posts_created += 1
-                    post_id = post_result.get("id", "")
-                    if post_id:
-                        post_link = f"https://www.facebook.com/{post_id}"
-                        post_links.append(post_link)
-                        await update.message.reply_text(f"تم نشر البوست ✅\n{post_link}")
                 except Exception as e:
                     logger.exception("فشل إنشاء بوست (%s)", caption)
                     last_error = str(e)
@@ -577,10 +571,6 @@ async def process_pdf(
     if last_error and posts_created == 0:
         summary += f"\n\nآخر خطأ:\n{last_error}"
     await update.message.reply_text(summary)
-
-    if post_links:
-        links_text = "روابط البوستات:\n" + "\n".join(post_links)
-        await update.message.reply_text(links_text)
 
 
 async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
