@@ -204,10 +204,6 @@ class FacebookRateLimitError(Exception):
     """بيترمى لما فيسبوك يرفض الطلب بسبب rate limit حتى بعد كل المحاولات."""
 
 
-class FacebookApiError(Exception):
-    """بيترمى لما فيسبوك يرفض الطلب بسبب توكن/صلاحيات/أي خطأ تاني، وبيحمل رسالة فيسبوك الحقيقية."""
-
-
 def _fb_error_info(response: requests.Response) -> dict:
     try:
         return response.json().get("error", {})
@@ -265,11 +261,6 @@ def _fb_request_with_retry(method: str, url: str, **kwargs) -> requests.Response
 
         # خطأ تاني مش rate limit -> يتعامل بيه زي ما كان (يتسجل ويترمى فورًا)
         _log_fb_error(response, fb_error)
-        if fb_error.get("message"):
-            raise FacebookApiError(
-                f"{fb_error.get('message')} (code={fb_error.get('code')}, "
-                f"subcode={fb_error.get('error_subcode')})"
-            )
         response.raise_for_status()
 
 
