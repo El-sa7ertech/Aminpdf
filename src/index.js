@@ -1,5 +1,5 @@
 // استبدل هذا بالرابط الذي يمنحك إياه cloudflared في Termux
-const TUNNEL_DOMAIN = "your-tunnel-subdomain.trycloudflare.com";
+const TUNNEL_DOMAIN = "drove-counts-meter-undertaken.trycloudflare.com";
 
 export default {
   async fetch(request, env, ctx) {
