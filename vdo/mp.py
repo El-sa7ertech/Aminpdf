@@ -108,12 +108,25 @@ def domain_ok(url):
     return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
 
 
-def to_url(t):
+def to_urls(t):
     if t.startswith("http"):
-        return t if domain_ok(t) else None
+        return [t] if domain_ok(t) else []
     if t.replace(".", "").replace("-", "").replace("_", "").isalnum():
-        return f"https://www.facebook.com/{t}/videos"
-    return None
+        # اسم صفحة: جرّب تبويب الريلز أولًا ثم الفيديوهات
+        return [f"https://www.facebook.com/{t}/reels",
+                f"https://www.facebook.com/{t}/videos"]
+    return []
+
+
+def human_size(n):
+    return f"{n / 1024**2:.2f} MB"
+
+
+def fmt_duration(sec):
+    if not sec:
+        return "؟"
+    sec = int(sec)
+    return f"{sec // 60}:{sec % 60:02d}"
 
 
 def list_entries(url):
@@ -155,7 +168,7 @@ def download_one(m, e, idx):
     name = e.get("title") or "مقطع"
     try:
         with yt_dlp.YoutubeDL(make_opts(base)) as ydl:
-            ydl.download([e["url"]])
+            info = ydl.extract_info(e["url"], download=True) or {}
         files = [p for p in glob.glob(base + ".*")
                  if not p.endswith((".part", ".ytdl"))]
         files.sort(key=lambda p: p.endswith(".mp3"), reverse=True)
@@ -163,10 +176,23 @@ def download_one(m, e, idx):
             bot.send_message(m.chat.id, f"تعذر تحميل: {name}")
             return
         path = files[0]
-        if os.path.getsize(path) > MAX_SIZE:
-            bot.send_message(m.chat.id, f"المقطع كبير جدًا: {name}")
+        size = os.path.getsize(path)
+        title = info.get("title") or name
+        desc = (info.get("description") or "").strip()
+        details = (f"📦 الحجم: {human_size(size)}\n"
+                   f"⏱ المدة: {fmt_duration(info.get('duration'))}\n"
+                   f"🔗 {info.get('webpage_url') or e['url']}")
+        if desc and desc != title:
+            details += f"\n\n📝 النص المكتوب:\n{desc}"
+        elif title:
+            details += f"\n\n📝 {title}"
+
+        if size > MAX_SIZE:
+            bot.send_message(m.chat.id,
+                             f"المقطع كبير جدًا ولم يُرسل:\n{details}"[:4000])
             return
-        send_file(m.chat.id, path, e.get("title"))
+        send_file(m.chat.id, path, title)
+        bot.send_message(m.chat.id, details[:4000])
         time.sleep(2)
     except Exception as ex:
         traceback.print_exc()
@@ -182,18 +208,34 @@ def process(m, targets):
     bot.reply_to(m, "جاري جلب قائمة المقاطع...")
     entries = []
     for t in targets:
-        url = to_url(t)
-        if not url:
+        urls = to_urls(t)
+        if not urls:
             bot.send_message(m.chat.id, "مدخل غير صالح أو دومين غير مدعوم")
             continue
-        try:
-            entries += list_entries(url)
-        except Exception as ex:
-            traceback.print_exc()
+        found, last_err = [], None
+        for url in urls:
+            try:
+                found = list_entries(url)
+                if found:
+                    break
+            except Exception as ex:
+                traceback.print_exc()
+                last_err = ex
+        if found:
+            entries += found
+        else:
             msg = "فشل جلب القائمة. إن كان الرابط لصفحة فيسبوك فأرسل روابط المقاطع نفسها"
-            if DEBUG:
-                msg += "\n" + str(ex)[:300]
+            if DEBUG and last_err:
+                msg += "\n" + str(last_err)[:300]
             bot.send_message(m.chat.id, msg)
+
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen, uniq = set(), []
+    for e in entries:
+        if e["url"] not in seen:
+            seen.add(e["url"])
+            uniq.append(e)
+    entries = uniq
 
     entries = entries[:MAX_VIDEOS]
     if not entries:
@@ -226,3 +268,4 @@ def handle(m):
 
 
 bot.infinity_polling(skip_pending=True)
+
